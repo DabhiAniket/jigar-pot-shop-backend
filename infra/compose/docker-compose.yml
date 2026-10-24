@@ -1,0 +1,116 @@
+# Production-like single-host stack: nginx → web (Next.js) + api (Express) + worker, MongoDB
+# replica set, Redis. For real production prefer managed MongoDB (Atlas), managed Redis, object
+# storage (S3/R2) + CDN, and several api/web replicas behind a load balancer (docs/DEPLOYMENT.md).
+# The web image is built from the frontend repository, checked out next to this one
+# (override with FRONTEND_DIR). Run from this folder (infra/compose):
+#   cp .env.example .env   # fill in secrets
+#   docker compose up -d --build
+#   docker compose run --rm api node dist/bootstrap-admin.js    # first Super Admin
+name: jigar-matka-house
+
+x-api-env: &api-env
+  NODE_ENV: production
+  APP_SECRET: ${APP_SECRET:?set APP_SECRET}
+  MONGODB_URI: ${MONGODB_URI:-mongodb://mongo:27017/jigar_matka?replicaSet=rs0}
+  REDIS_URL: redis://redis:6379
+  JOBS_DRIVER: bullmq
+  PUBLIC_WEB_URL: ${PUBLIC_WEB_URL:-http://localhost:8080}
+  TRUST_PROXY: ${TRUST_PROXY:-1}
+  COOKIE_SECURE: ${COOKIE_SECURE:-true}
+  STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
+  STORAGE_LOCAL_DIR: /data/storage
+  MEDIA_PUBLIC_BASE_URL: ${MEDIA_PUBLIC_BASE_URL:-http://localhost:8080/media}
+  S3_BUCKET: ${S3_BUCKET:-}
+  S3_REGION: ${S3_REGION:-}
+  S3_ENDPOINT: ${S3_ENDPOINT:-}
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+  WHATSAPP_BUSINESS_NUMBER: ${WHATSAPP_BUSINESS_NUMBER:-}
+  WEB_REVALIDATE_URL: http://web:3000/api/revalidate
+  REVALIDATE_SECRET: ${REVALIDATE_SECRET:?set REVALIDATE_SECRET}
+  INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
+  METRICS_TOKEN: ${METRICS_TOKEN:-}
+  SMTP_URL: ${SMTP_URL:-}
+  MAIL_FROM: ${MAIL_FROM:-}
+  BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+  BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+
+services:
+  mongo:
+    image: mongo:8.0
+    command: ['--replSet', 'rs0', '--bind_ip_all']
+    volumes: [mongo-data:/data/db]
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'mongosh',
+          '--quiet',
+          '--eval',
+          "try { rs.status().ok } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:27017'}]}).ok }",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: ['redis-server', '--appendonly', 'yes', '--maxmemory-policy', 'noeviction']
+    volumes: [redis-data:/data]
+    healthcheck: { test: ['CMD', 'redis-cli', 'ping'], interval: 5s, retries: 20 }
+    restart: unless-stopped
+
+  migrate:
+    build: { context: ../.., dockerfile: Dockerfile }
+    image: jmh-api
+    command: ['node', 'dist/migrate.js']
+    environment: *api-env
+    depends_on: { mongo: { condition: service_healthy } }
+    restart: 'no'
+
+  api:
+    image: jmh-api
+    environment: *api-env
+    volumes: [media:/data/storage]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+    deploy: { replicas: 1 }
+
+  worker:
+    image: jmh-api
+    command: ['node', 'dist/worker.js']
+    environment: *api-env
+    volumes: [media:/data/storage]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ${FRONTEND_DIR:-../../../jigar-pot-shop}
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: http://api:4000
+        NEXT_PUBLIC_SITE_URL: ${PUBLIC_WEB_URL:-http://localhost:8080}
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://api:4000
+      REVALIDATE_SECRET: ${REVALIDATE_SECRET:?set REVALIDATE_SECRET}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
+    depends_on: [api]
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports: ['${HTTP_PORT:-8080}:80']
+    volumes: ['../nginx/default.conf:/etc/nginx/conf.d/default.conf:ro']
+    depends_on: [web, api]
+    restart: unless-stopped
+
+volumes:
+  mongo-data:
+  redis-data:
+  media:

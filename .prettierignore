@@ -1,0 +1,9 @@
+node_modules
+dist
+coverage
+storage
+.vercel
+package-lock.json
+seed/images
+*.webp
+*.png

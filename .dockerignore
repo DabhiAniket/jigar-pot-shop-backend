@@ -1,0 +1,14 @@
+**/node_modules
+**/dist
+**/coverage
+**/.env
+**/.env.*
+!**/.env.example
+.data
+storage
+.tmp
+.git
+.vercel
+loadtest
+infra
+docs

@@ -1,0 +1,34 @@
+# dependencies
+node_modules/
+.pnp.*
+
+# builds
+dist/
+*.tsbuildinfo
+
+# env & secrets
+.env
+.env.*
+!.env.example
+*.pem
+
+# local data
+.data/
+/storage/
+/.tmp/
+
+# test output
+coverage/
+loadtest/results/*.json
+!loadtest/results/.gitkeep
+
+# logs / OS / editor
+*.log
+npm-debug.log*
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Vercel CLI local state and build output
+.vercel
