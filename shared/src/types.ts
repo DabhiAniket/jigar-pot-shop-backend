@@ -344,6 +344,8 @@ export interface PublicOrderDTO {
 
 export interface CreateOrderResponse {
   order: PublicOrderDTO;
+  /** Guest checkout only: the private link token for the confirmation page. */
+  accessToken?: string;
   /** True when the request was a retry of an order that already exists. */
   replayed: boolean;
 }
