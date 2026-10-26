@@ -41,7 +41,7 @@ const envSchema = z
     SESSION_TTL_HOURS: z.coerce.number().min(1).max(720).default(12),
     SESSION_IDLE_MINUTES: z.coerce.number().min(5).max(1440).default(120),
 
-    STORAGE_DRIVER: z.enum(['local', 's3']).default('local'),
+    STORAGE_DRIVER: z.enum(['local', 's3', 'blob']).default('local'),
     STORAGE_LOCAL_DIR: z.string().default('./storage'),
     MEDIA_PUBLIC_BASE_URL: z.url(),
     S3_BUCKET: optionalString,
@@ -50,6 +50,8 @@ const envSchema = z
     S3_ACCESS_KEY_ID: optionalString,
     S3_SECRET_ACCESS_KEY: optionalString,
     S3_FORCE_PATH_STYLE: flag.default(false),
+    // Vercel Blob read-write token. Server-only: never send it to the browser.
+    BLOB_READ_WRITE_TOKEN: optionalString,
 
     MEDIA_MAX_UPLOAD_MB: z.coerce.number().min(1).max(50).default(15),
     MEDIA_MAX_INPUT_PIXELS: z.coerce
@@ -91,11 +93,28 @@ const envSchema = z
           });
       }
     }
+    if (env.STORAGE_DRIVER === 'blob') {
+      if (!env.BLOB_READ_WRITE_TOKEN)
+        ctx.addIssue({
+          code: 'custom',
+          path: ['BLOB_READ_WRITE_TOKEN'],
+          message: 'BLOB_READ_WRITE_TOKEN is required when STORAGE_DRIVER=blob',
+        });
+      if (
+        !/^https:\/\/[^/]+\.public\.blob\.vercel-storage\.com\/?$/.test(env.MEDIA_PUBLIC_BASE_URL)
+      )
+        ctx.addIssue({
+          code: 'custom',
+          path: ['MEDIA_PUBLIC_BASE_URL'],
+          message:
+            'MEDIA_PUBLIC_BASE_URL must be the Blob store public URL (https://<id>.public.blob.vercel-storage.com)',
+        });
+    }
     if (env.VERCEL && env.STORAGE_DRIVER === 'local') {
       ctx.addIssue({
         code: 'custom',
         path: ['STORAGE_DRIVER'],
-        message: 'Vercel functions have a read-only filesystem: set STORAGE_DRIVER=s3',
+        message: 'Vercel functions have a read-only filesystem: set STORAGE_DRIVER=blob (or s3)',
       });
     }
     if (env.JOBS_DRIVER === 'bullmq' && !env.REDIS_URL) {
@@ -195,6 +214,7 @@ function buildConfig(source: NodeJS.ProcessEnv) {
       driver: env.STORAGE_DRIVER,
       localDir: path.resolve(env.STORAGE_LOCAL_DIR),
       publicBaseUrl: env.MEDIA_PUBLIC_BASE_URL.replace(/\/+$/, ''),
+      blobToken: env.BLOB_READ_WRITE_TOKEN ?? null,
       s3:
         env.STORAGE_DRIVER === 's3'
           ? {

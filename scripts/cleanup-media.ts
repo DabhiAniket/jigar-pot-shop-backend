@@ -6,10 +6,11 @@
  *   npm run media:cleanup -- --days 30            # report
  *   npm run media:cleanup -- --days 30 --apply    # delete
  */
+import { del, list } from '@vercel/blob';
 import { connect, createContext } from '../src/bootstrap';
 import { getConfig } from '../src/config/env';
 import { disconnectDatabase } from '../src/db/connection';
-import { deleteAsset, findOrphanedAssets } from '../src/media/media.service';
+import { CLIENT_UPLOAD_PREFIX, deleteAsset, findOrphanedAssets } from '../src/media/media.service';
 
 const args = process.argv.slice(2);
 const apply = args.includes('--apply');
@@ -46,6 +47,18 @@ try {
       }
     }
     console.log(`Deleted ${deleted} image(s).`);
+  }
+  // Browser uploads to Blob that were never turned into an image (e.g. the admin closed the tab).
+  const token = config.storage.blobToken;
+  if (token) {
+    const { blobs } = await list({ prefix: CLIENT_UPLOAD_PREFIX, token, limit: 1000 });
+    const stale = blobs.filter((blob) => blob.uploadedAt < new Date(Date.now() - 86_400_000));
+    console.log(`${stale.length} abandoned temporary upload(s) older than 1 day.`);
+    if (apply && stale.length)
+      await del(
+        stale.map((blob) => blob.url),
+        { token },
+      );
   }
 } finally {
   await ctx.jobs.close();

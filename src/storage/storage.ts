@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { del, get, put } from '@vercel/blob';
 import {
   DeleteObjectsCommand,
   GetObjectCommand,
@@ -8,7 +9,7 @@ import {
   S3Client,
 } from '@aws-sdk/client-s3';
 import type { AppConfig } from '../config/env';
-import { randomToken } from '../lib/crypto';
+import { hmac, randomToken } from '../lib/crypto';
 
 /**
  * Two areas:
@@ -17,7 +18,7 @@ import { randomToken } from '../lib/crypto';
  *             never exposed over HTTP
  */
 export interface Storage {
-  readonly driver: 'local' | 's3';
+  readonly driver: 'local' | 's3' | 'blob';
   putPublic(key: string, body: Buffer, contentType: string): Promise<void>;
   putPrivate(key: string, body: Buffer, contentType: string): Promise<void>;
   getPrivate(key: string): Promise<Buffer>;
@@ -198,12 +199,88 @@ class S3Storage implements Storage {
   }
 }
 
+/**
+ * Vercel Blob. One store holds everything, and public blobs are URL-addressable, so private
+ * objects live under an HMAC-derived path nobody can guess. Public keys map 1:1 to Blob
+ * pathnames (no random suffix), which keeps the database's keys and URL shape unchanged.
+ */
+class BlobStorage implements Storage {
+  readonly driver = 'blob' as const;
+
+  constructor(
+    private readonly token: string,
+    private readonly publicBaseUrl: string,
+    private readonly secret: string,
+  ) {}
+
+  private privatePath(key: string): string {
+    assertSafeKey(key);
+    return `private/${hmac(this.secret, key).slice(0, 32)}/${key}`;
+  }
+
+  async putPublic(key: string, body: Buffer, contentType: string): Promise<void> {
+    assertSafeKey(key);
+    const blob = await put(key, body, {
+      access: 'public',
+      token: this.token,
+      contentType,
+      addRandomSuffix: false,
+      allowOverwrite: true,
+      cacheControlMaxAge: 31_536_000,
+    });
+    // Catches a MEDIA_PUBLIC_BASE_URL that does not point at this store before bad URLs are saved.
+    if (blob.url !== this.publicUrl(key))
+      throw new Error(`Blob URL ${blob.url} does not match MEDIA_PUBLIC_BASE_URL`);
+  }
+
+  async putPrivate(key: string, body: Buffer, contentType: string): Promise<void> {
+    await put(this.privatePath(key), body, {
+      access: 'public',
+      token: this.token,
+      contentType,
+      addRandomSuffix: false,
+      allowOverwrite: true,
+      cacheControlMaxAge: 60,
+    });
+  }
+
+  async getPrivate(key: string): Promise<Buffer> {
+    const result = await get(this.privatePath(key), {
+      access: 'public',
+      token: this.token,
+      useCache: false,
+    });
+    if (!result?.stream) throw new Error(`Missing object: ${key}`);
+    return Buffer.from(await new Response(result.stream).arrayBuffer());
+  }
+
+  async deletePublic(keys: string[]): Promise<void> {
+    keys.forEach(assertSafeKey);
+    if (keys.length) await del(keys, { token: this.token });
+  }
+
+  async deletePrivate(keys: string[]): Promise<void> {
+    if (keys.length) await del(keys.map((key) => this.privatePath(key)), { token: this.token });
+  }
+
+  publicUrl(key: string): string {
+    return `${this.publicBaseUrl}/${key}`;
+  }
+
+  // shortcut: no network probe (Blob list/head calls are billed operations), upgrade if a probe is needed.
+  async healthCheck(): Promise<boolean> {
+    return Boolean(this.token);
+  }
+}
+
 let instance: Storage | null = null;
 
 export function getStorage(config: AppConfig): Storage {
   if (!instance) {
     instance =
-      config.storage.driver === 's3' && config.storage.s3
+      config.storage.driver === 'blob' && config.storage.blobToken
+        ? new BlobStorage(config.storage.blobToken, config.storage.publicBaseUrl, config.appSecret)
+        : config.storage.driver === 's3' && config.storage.s3
         ? new S3Storage(config.storage.s3.bucket, config.storage.publicBaseUrl, config.storage.s3)
         : new LocalStorage(config.storage.localDir, config.storage.publicBaseUrl);
   }

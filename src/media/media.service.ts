@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { del, head } from '@vercel/blob';
 import { Types } from 'mongoose';
 import type { MediaCrop } from '@jmh/shared';
 import type { AppContext } from '../context';
@@ -32,6 +33,32 @@ const MAX_ATTEMPTS = 3;
 export function sanitizeFilename(name: string): string {
   const base = path.basename(name).normalize('NFKC');
   return base.replace(/[^\p{L}\p{N}._ -]+/gu, '_').slice(0, 120) || 'upload';
+}
+
+/** Where browsers put originals that are too big for a Vercel function request body. */
+export const CLIENT_UPLOAD_PREFIX = 'client-uploads/';
+
+/**
+ * Reads an original the browser uploaded straight to Blob (see the blob-token route), then
+ * removes the temporary blob. Only pathnames under CLIENT_UPLOAD_PREFIX of our own store are read.
+ */
+export async function takeClientUpload(ctx: AppContext, pathname: string): Promise<Buffer> {
+  const token = ctx.config.storage.blobToken;
+  if (!token || !pathname.startsWith(CLIENT_UPLOAD_PREFIX) || pathname.includes('..'))
+    throw validationFailed({ file: ['Direct uploads are not available.'] });
+  try {
+    const meta = await head(pathname, { token }).catch(() => null);
+    if (!meta) throw validationFailed({ file: ['The uploaded file was not found. Try again.'] });
+    if (meta.size > ctx.config.media.maxUploadBytes)
+      throw validationFailed({ file: ['This image is larger than the upload limit.'] });
+    const response = await fetch(meta.url);
+    if (!response.ok) throw new Error(`Could not read ${pathname}: ${response.status}`);
+    return Buffer.from(await response.arrayBuffer());
+  } finally {
+    await del(pathname, { token }).catch((error: Error) =>
+      logger.warn({ err: error.message, pathname }, 'could not delete temporary upload'),
+    );
+  }
 }
 
 export async function createUpload(

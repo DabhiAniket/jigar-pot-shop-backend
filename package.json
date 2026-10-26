@@ -21,6 +21,7 @@
     "db:migrate": "tsx --env-file-if-exists=.env scripts/migrate.ts",
     "admin:bootstrap": "tsx --env-file-if-exists=.env scripts/bootstrap-admin.ts",
     "seed:demo": "tsx --env-file-if-exists=.env scripts/seed-demo.ts",
+    "media:migrate-blob": "tsx --env-file-if-exists=.env scripts/migrate-media-to-blob.ts",
     "media:cleanup": "tsx --env-file-if-exists=.env scripts/cleanup-media.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -31,6 +32,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1155.0",
+    "@vercel/blob": "^2.8.2",
     "argon2": "^0.45.1",
     "bullmq": "^6.4.0",
     "cookie-parser": "^1.4.7",

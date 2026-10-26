@@ -32,3 +32,4 @@ npm-debug.log*
 
 # Vercel CLI local state and build output
 .vercel
+.env*

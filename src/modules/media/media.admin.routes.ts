@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { ipKeyGenerator } from 'express-rate-limit';
+import { handleUpload, type HandleUploadBody } from '@vercel/blob/client';
 import multer from 'multer';
 import { Types, type QueryFilter } from 'mongoose';
 import {
@@ -21,6 +22,8 @@ import {
   createUpload,
   deleteAsset,
   findOrphanedAssets,
+  CLIENT_UPLOAD_PREFIX,
+  takeClientUpload,
 } from '../../media/media.service';
 import { mediaAssetDTO } from '../../media/serialize';
 import { audit } from '../audit/audit.service';
@@ -45,20 +48,63 @@ export function mediaAdminRoutes(ctx: AppContext, limiter: LimiterFactory): Rout
       req.admin ? `admin:${req.admin.id.toString()}` : ipKeyGenerator(req.ip ?? 'unknown'),
   });
 
+  // Step 1 of the large-file flow: hands the browser a short-lived token scoped to one pathname,
+  // image types and the size cap. The read-write token itself never leaves the server.
+  router.post('/blob-token', requirePermission('media:write'), uploadLimiter, async (req, res) => {
+    const token = ctx.config.storage.blobToken;
+    if (!token) throw validationFailed({ file: ['Direct uploads are not available.'] });
+    const result = await handleUpload({
+      token,
+      request: req,
+      body: req.body as HandleUploadBody,
+      onBeforeGenerateToken: async (pathname) => {
+        if (!pathname.startsWith(CLIENT_UPLOAD_PREFIX) || pathname.includes('..'))
+          throw validationFailed({ file: ['Invalid upload path.'] });
+        return {
+          allowedContentTypes: [...ACCEPTED_IMAGE_MIME_TYPES],
+          maximumSizeInBytes: ctx.config.media.maxUploadBytes,
+          addRandomSuffix: true,
+        };
+      },
+    });
+    res.json(result);
+  });
+
   router.post(
     '/',
     requirePermission('media:write'),
     uploadLimiter,
     upload.single('file'),
     async (req, res) => {
-      if (!req.file) throw validationFailed({ file: ['Choose an image to upload.'] });
-      const crop = req.body.crop ? parseInput(mediaCropSchema, safeJson(req.body.crop)) : null;
+      let buffer: Buffer;
+      let originalName: string;
+      let rawCrop: unknown = req.body.crop;
+      if (req.is('application/json')) {
+        // Large file: it already sits in Blob (step 2 of the flow above).
+        const input = parseInput(
+          z.object({
+            blobPathname: z.string().max(300),
+            originalName: z.string().max(300),
+            crop: mediaCropSchema.nullable().default(null),
+          }),
+          req.body,
+        );
+        buffer = await takeClientUpload(ctx, input.blobPathname);
+        originalName = input.originalName;
+        rawCrop = input.crop;
+      } else {
+        if (!req.file) throw validationFailed({ file: ['Choose an image to upload.'] });
+        buffer = req.file.buffer;
+        originalName = req.file.originalname;
+        rawCrop = rawCrop ? safeJson(rawCrop) : null;
+      }
+      const crop = rawCrop ? parseInput(mediaCropSchema, rawCrop) : null;
       const { alt } = parseInput(z.object({ alt: z.string().trim().max(200).default('') }), {
         alt: req.body.alt,
       });
       const asset = await createUpload(ctx, {
-        buffer: req.file.buffer,
-        originalName: req.file.originalname,
+        buffer,
+        originalName,
         crop,
         alt,
         actorId: req.admin!.id,
