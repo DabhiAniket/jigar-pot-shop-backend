@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type Request } from 'express';
 import { ipKeyGenerator } from 'express-rate-limit';
 import { handleUpload, type HandleUploadBody } from '@vercel/blob/client';
 import multer from 'multer';
@@ -24,6 +24,7 @@ import {
   findOrphanedAssets,
   CLIENT_UPLOAD_PREFIX,
   recropAsset,
+  replaceAssetInPlace,
   takeClientUpload,
 } from '../../media/media.service';
 import { mediaAssetDTO } from '../../media/serialize';
@@ -120,6 +121,80 @@ export function mediaAdminRoutes(ctx: AppContext, limiter: LimiterFactory): Rout
     },
   );
 
+  /** Reads an uploaded picture: multipart for small files, or a reference to a Blob upload. */
+  async function readUploadInput(req: Request) {
+    let buffer: Buffer;
+    let originalName: string;
+    let rawCrop: unknown = req.body.crop;
+    if (req.is('application/json')) {
+      // Large file: it already sits in Blob (step 2 of the flow above).
+      const input = parseInput(
+        z.object({
+          blobPathname: z.string().max(300),
+          originalName: z.string().max(300),
+          crop: mediaCropSchema.nullable().default(null),
+        }),
+        req.body,
+      );
+      buffer = await takeClientUpload(ctx, input.blobPathname);
+      originalName = input.originalName;
+      rawCrop = input.crop;
+    } else {
+      if (!req.file) throw validationFailed({ file: ['Choose an image to upload.'] });
+      buffer = req.file.buffer;
+      originalName = req.file.originalname;
+      rawCrop = rawCrop ? safeJson(rawCrop) : null;
+    }
+    const crop = rawCrop ? parseInput(mediaCropSchema, rawCrop) : null;
+    const { alt } = parseInput(z.object({ alt: z.string().trim().max(200).default('') }), {
+      alt: req.body.alt,
+    });
+    return { buffer, originalName, crop, alt };
+  }
+
+  router.post(
+    '/',
+    requirePermission('media:write'),
+    uploadLimiter,
+    upload.single('file'),
+    async (req, res) => {
+      const input = await readUploadInput(req);
+      const asset = await createUpload(ctx, { ...input, actorId: req.admin!.id });
+      await audit(req, {
+        action: 'media.upload',
+        entityType: 'media',
+        entityId: asset._id.toString(),
+        summary: `Uploaded image “${asset.originalFilename}” (${Math.round(asset.sourceBytes / 1024)} KB)`,
+      });
+      res.status(202).json({ data: mediaAssetDTO(asset, ctx.storage, 0) });
+    },
+  );
+
+  // Replace the picture of an existing image record; everything using it updates at once.
+  router.post(
+    '/:id/replace',
+    requirePermission('media:write'),
+    uploadLimiter,
+    upload.single('file'),
+    async (req, res) => {
+      const id = parseInput(objectIdSchema, req.params.id);
+      const input = await readUploadInput(req);
+      const asset = await replaceAssetInPlace(ctx, id, {
+        buffer: input.buffer,
+        originalName: input.originalName,
+        crop: input.crop,
+        alt: input.alt || undefined,
+      });
+      await audit(req, {
+        action: 'media.replace',
+        entityType: 'media',
+        entityId: id,
+        summary: `Replaced the picture of image “${asset.originalFilename}” (revision ${asset.revision})`,
+      });
+      res.json({ data: mediaAssetDTO(asset, ctx.storage, null) });
+    },
+  );
+
   router.post('/:id/recrop', requirePermission('media:write'), uploadLimiter, async (req, res) => {
     const id = parseInput(objectIdSchema, req.params.id);
     const input = parseInput(
@@ -129,14 +204,14 @@ export function mediaAdminRoutes(ctx: AppContext, limiter: LimiterFactory): Rout
       }),
       req.body,
     );
-    const asset = await recropAsset(ctx, id, { ...input, actorId: req.admin!.id });
+    const asset = await recropAsset(ctx, id, input);
     await audit(req, {
       action: 'media.recrop',
       entityType: 'media',
-      entityId: asset._id.toString(),
-      summary: `Re-cropped image “${asset.originalFilename}” into a new image`,
+      entityId: id,
+      summary: `Re-cropped image “${asset.originalFilename}” (revision ${asset.revision})`,
     });
-    res.status(202).json({ data: mediaAssetDTO(asset, ctx.storage, 0) });
+    res.json({ data: mediaAssetDTO(asset, ctx.storage, null) });
   });
 
   router.get('/', requirePermission('media:read'), async (req, res) => {

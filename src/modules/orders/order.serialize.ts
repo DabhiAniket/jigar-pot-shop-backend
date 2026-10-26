@@ -99,6 +99,8 @@ export function adminOrderListItem(order: Order): AdminOrderListItem {
     total: order.pricing.total,
     createdAt: order.createdAt.toISOString(),
     cancellationRequest: order.cancellationRequest?.status ?? null,
+    allowedTransitions: [...nextOrderStatuses(order.status)],
+    hasShipment: Boolean(order.shipment),
   };
 }
 
