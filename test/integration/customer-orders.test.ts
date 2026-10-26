@@ -246,6 +246,76 @@ describe('order ownership: Customer B can never reach Customer A’s order', () 
   });
 });
 
+describe('claiming an earlier guest order', () => {
+  async function guestOrder() {
+    const product = await createPublishedProduct(harness, { stock: 9 });
+    const placed = await harness
+      .request()
+      .post('/api/v1/orders')
+      .set('Origin', ORIGIN)
+      .set('Idempotency-Key', randomUUID())
+      .send(checkoutBody([{ productId: product.id, quantity: 1 }]));
+    expect(placed.status).toBe(201);
+    return {
+      number: placed.body.data.order.orderNumber as string,
+      token: placed.body.data.accessToken as string,
+    };
+  }
+
+  it('adds the order to My orders only with the order number and the phone it was placed with', async () => {
+    const guest = await guestOrder(); // checkoutBody's phone is 9876543210
+    const wrong = await b.post('/api/v1/account/orders/claim', {
+      orderNumber: guest.number,
+      phone: '9876500099',
+    });
+    expect(wrong.status).toBe(404);
+    expect(
+      (await b.get('/api/v1/account/orders')).body.data.map(
+        (o: { orderNumber: string }) => o.orderNumber,
+      ),
+    ).not.toContain(guest.number);
+
+    const claimed = await b.post('/api/v1/account/orders/claim', {
+      orderNumber: guest.number,
+      phone: '9876543210',
+    });
+    expect(claimed.status).toBe(200);
+    expect(claimed.body.data.orderNumber).toBe(guest.number);
+    expect((await b.get(`/api/v1/account/orders/${guest.number}`)).status).toBe(200);
+    expect((await a.get(`/api/v1/account/orders/${guest.number}`)).status).toBe(404);
+    // Once owned, the guest link and phone lookup stop serving it, and nobody else can claim it.
+    expect(
+      (await harness.request().get(`/api/v1/orders/${guest.number}?token=${guest.token}`)).status,
+    ).toBe(404);
+    const again = await a.post('/api/v1/account/orders/claim', {
+      orderNumber: guest.number,
+      phone: '9876543210',
+    });
+    expect(again.status).toBe(404);
+  });
+
+  it('cannot take an order that already belongs to an account, and needs a session and CSRF', async () => {
+    const mine = await aliceOrders();
+    const steal = await b.post('/api/v1/account/orders/claim', {
+      orderNumber: mine.number,
+      phone: '9876543210',
+    });
+    expect(steal.status).toBe(404);
+    expect((await a.get(`/api/v1/account/orders/${mine.number}`)).status).toBe(200);
+    const anonymous = await harness
+      .request()
+      .post('/api/v1/account/orders/claim')
+      .set('Origin', ORIGIN)
+      .send({ orderNumber: mine.number, phone: '9876543210' });
+    expect(anonymous.status).toBe(401);
+    const noCsrf = await bob.agent
+      .post('/api/v1/account/orders/claim')
+      .set('Origin', ORIGIN)
+      .send({ orderNumber: mine.number, phone: '9876543210' });
+    expect(noCsrf.status).toBe(403);
+  });
+});
+
 describe('server cart', () => {
   it('keeps each customer’s cart private and persistent', async () => {
     const product = await createPublishedProduct(harness, { price: 500_00, stock: 9 });

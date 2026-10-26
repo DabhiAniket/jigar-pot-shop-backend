@@ -9,6 +9,7 @@ import {
   limitQuerySchema,
   loginSchema,
   LIMITS,
+  orderTrackSchema,
   objectIdSchema,
   orderNumberSchema,
   ORDER_STATUSES,
@@ -300,6 +301,21 @@ export function accountRoutes(ctx: AppContext, limiter: LimiterFactory): Router 
         totalPages: Math.ceil(total / query.limit),
       },
     });
+  });
+
+  // Attach an order placed before signing in (as a guest) to this account. Proof is the same as
+  // for guest tracking: the order number AND the phone it was placed with. Only unowned orders
+  // can be claimed, and the claim is a single atomic update, so two people cannot both win.
+  const claimLimiter = limiter({ name: 'order-claim', windowMs: 15 * 60_000, limit: 10 });
+  router.post('/orders/claim', claimLimiter, async (req, res) => {
+    const input = parseInput(orderTrackSchema, req.body);
+    const order = await OrderModel.findOneAndUpdate(
+      { orderNumber: input.orderNumber, 'customer.phone': input.phone, accountId: null },
+      { $set: { accountId: req.customer!.id } },
+      { returnDocument: 'after' },
+    ).lean<Order>();
+    if (!order) throw notFound('Order');
+    res.json({ data: customerOrderListItem(order, ctx.storage) });
   });
 
   router.get('/orders/:orderNumber', async (req, res) => {
