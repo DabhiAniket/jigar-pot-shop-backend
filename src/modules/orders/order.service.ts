@@ -118,8 +118,8 @@ export async function createOrder(
   ctx: AppContext,
   input: CheckoutInput,
   idempotencyKey: string | null,
-  /** From the verified session, never from the request body. */
-  accountId: Types.ObjectId,
+  /** From the verified session, never from the request body. Null for a guest checkout. */
+  accountId: Types.ObjectId | null,
 ): Promise<CreateOrderResult> {
   const requestHash = canonicalHash(input);
   if (idempotencyKey) {
@@ -164,10 +164,13 @@ export async function createOrder(
 function replay(
   existing: Order,
   requestHash: string,
-  accountId: Types.ObjectId,
+  accountId: Types.ObjectId | null,
 ): CreateOrderResult {
-  // An idempotency key must never hand one customer another customer's order.
-  if (!existing.accountId || !existing.accountId.equals(accountId)) {
+  // An idempotency key must never hand one customer (or a guest) another customer's order.
+  const sameOwner = accountId
+    ? Boolean(existing.accountId?.equals(accountId))
+    : !existing.accountId;
+  if (!sameOwner) {
     throw new AppError(
       422,
       'IDEMPOTENCY_KEY_REUSED',
@@ -192,7 +195,7 @@ async function placeOrder(
     requestHash: string;
     settings: StoreSettingsDoc;
     session: ClientSession;
-    accountId: Types.ObjectId;
+    accountId: Types.ObjectId | null;
   },
 ): Promise<Order> {
   const { session, settings } = meta;

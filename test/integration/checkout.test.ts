@@ -338,16 +338,87 @@ describe('order placement', () => {
     );
   });
 
-  it('refuses checkout without a signed-in customer', async () => {
+  it('lets a guest place an order without signing in, reachable only through its private link', async () => {
     const product = await createPublishedProduct(harness);
-    const anonymous = await harness
+    const placed = await harness
       .request()
       .post('/api/v1/orders')
       .set('Origin', 'http://localhost:3000')
       .set('Idempotency-Key', randomUUID())
       .send(checkoutBody([{ productId: product.id, quantity: 1 }]));
-    expect(anonymous.status).toBe(401);
-    expect(await OrderModel.countDocuments({ 'items.product': product.id })).toBe(0);
+    expect(placed.status).toBe(201);
+    const { order, accessToken } = placed.body.data;
+    expect(accessToken).toEqual(expect.any(String));
+    const saved = await OrderModel.findOne({ orderNumber: order.orderNumber }).lean();
+    expect(saved!.accountId).toBeNull();
+
+    // An order number alone gives nothing; the token or the phone number does.
+    expect((await harness.request().get(`/api/v1/orders/${order.orderNumber}`)).status).toBe(404);
+    expect(
+      (await harness.request().get(`/api/v1/orders/${order.orderNumber}?token=${accessToken}`))
+        .status,
+    ).toBe(200);
+    expect(
+      (
+        await harness
+          .request()
+          .post('/api/v1/orders/track')
+          .send({ orderNumber: order.orderNumber, phone: '9876543210' })
+      ).status,
+    ).toBe(200);
+    // A signed-in customer cannot read it from their account either.
+    expect(
+      (await customerClient(buyer).get(`/api/v1/account/orders/${order.orderNumber}`)).status,
+    ).toBe(404);
+  });
+
+  it('validates guest checkout server-side too: prices come from the database and stock is enforced', async () => {
+    const product = await createPublishedProduct(harness, { price: 500_00, stock: 2 });
+    const guest = (body: object) =>
+      harness
+        .request()
+        .post('/api/v1/orders')
+        .set('Origin', 'http://localhost:3000')
+        .set('Idempotency-Key', randomUUID())
+        .send(body);
+    const priced = await guest({
+      ...checkoutBody([{ productId: product.id, quantity: 1 }]),
+      total: 1,
+      items: [{ productId: product.id, quantity: 1, price: 1 }],
+    });
+    expect(priced.status).toBe(201);
+    expect(priced.body.data.order.pricing.total).toBe(500_00);
+    const tooMany = await guest(checkoutBody([{ productId: product.id, quantity: 5 }]));
+    expect(tooMany.status).toBe(409);
+  });
+
+  it('never replays a guest order to an account, or an account order to a guest', async () => {
+    const product = await createPublishedProduct(harness, { stock: 9 });
+    const body = checkoutBody([{ productId: product.id, quantity: 1 }]);
+    const guestKey = randomUUID();
+    const guestPlaced = await harness
+      .request()
+      .post('/api/v1/orders')
+      .set('Origin', 'http://localhost:3000')
+      .set('Idempotency-Key', guestKey)
+      .send(body);
+    expect(guestPlaced.status).toBe(201);
+    const asAccount = await customerClient(buyer)
+      .post('/api/v1/orders', body)
+      .set('Idempotency-Key', guestKey);
+    expect(asAccount.status).toBe(422);
+
+    const accountKey = randomUUID();
+    const accountPlaced = await placeOrder(body, accountKey);
+    expect(accountPlaced.status).toBe(201);
+    const asGuest = await harness
+      .request()
+      .post('/api/v1/orders')
+      .set('Origin', 'http://localhost:3000')
+      .set('Idempotency-Key', accountKey)
+      .send(body);
+    expect(asGuest.status).toBe(422);
+    expect(JSON.stringify(asGuest.body)).not.toContain(accountPlaced.body.data.order.orderNumber);
   });
 
   it('never serves an account-owned order through the legacy token or phone lookups', async () => {
