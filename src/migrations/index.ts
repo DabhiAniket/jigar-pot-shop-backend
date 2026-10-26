@@ -5,7 +5,9 @@ import {
   AdminUserModel,
   AuditEventModel,
   CategoryModel,
+  CustomerAccountModel,
   CustomerModel,
+  CustomerSessionModel,
   HomeContentModel,
   InventoryMovementModel,
   MediaAssetModel,
@@ -14,6 +16,7 @@ import {
   PasswordResetTokenModel,
   ProductModel,
   PromotionModel,
+  ServerCartModel,
   StoreSettingsModel,
 } from '../db/models';
 import { logger } from '../lib/logger';
@@ -73,6 +76,23 @@ export const MIGRATIONS: Migration[] = [
         { createdAt: 1 },
         { name: 'audit_retention_ttl', expireAfterSeconds: seconds },
       );
+    },
+  },
+  {
+    // Customer accounts, sessions and carts, plus the owner index on orders. Additive only:
+    // existing orders keep accountId = null (legacy guest orders) and nothing is rewritten.
+    id: '004',
+    name: 'customer-accounts-and-order-ownership',
+    up: async () => {
+      for (const model of [
+        CustomerAccountModel,
+        CustomerSessionModel,
+        ServerCartModel,
+        OrderModel,
+      ]) {
+        await model.createCollection().catch(() => undefined);
+        await model.createIndexes();
+      }
     },
   },
 ];

@@ -11,10 +11,21 @@ export interface AuthenticatedAdmin {
   sessionTokenHash: string;
 }
 
+export interface AuthenticatedCustomer {
+  id: Types.ObjectId;
+  email: string;
+  name: string;
+  phone: string;
+  sessionId: Types.ObjectId;
+  sessionTokenHash: string;
+}
+
 declare global {
   namespace Express {
     interface Request {
       admin?: AuthenticatedAdmin;
+      /** Set only from a verified customer session cookie, never from request data. */
+      customer?: AuthenticatedCustomer;
     }
   }
 }

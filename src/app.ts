@@ -10,7 +10,14 @@ import { safeEqual } from './lib/crypto';
 import { logger } from './lib/logger';
 import { httpDuration, httpRequests, renderMetrics } from './lib/metrics';
 import { getRedis, pingRedis } from './lib/redis';
-import { csrfProtection, loadSession, originCheck } from './middleware/auth';
+import {
+  csrfProtection,
+  customerCsrfProtection,
+  loadCustomerSession,
+  loadSession,
+  originCheck,
+} from './middleware/auth';
+import { accountRoutes } from './modules/account/account.routes';
 import { forwardedClientIp } from './middleware/client-ip';
 import { errorHandler, notFoundHandler } from './middleware/error-handler';
 import { createLimiterFactory } from './middleware/rate-limit';
@@ -150,6 +157,8 @@ export function createApp(ctx: AppContext, state: AppState = { shuttingDown: fal
   const api = Router();
   api.use(limiter({ name: 'global', windowMs: 60_000, limit: 600 }));
   api.use(originCheck(config));
+  api.use(loadCustomerSession(config));
+  api.use('/account', customerCsrfProtection(config), accountRoutes(ctx, limiter));
   api.use(publicRoutes(ctx, limiter));
 
   const admin = Router();

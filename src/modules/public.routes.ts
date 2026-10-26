@@ -16,7 +16,15 @@ import {
 } from '@jmh/shared';
 import { z } from 'zod';
 import type { AppContext } from '../context';
-import { CategoryModel, OrderModel, ProductModel, PromotionModel, type Order } from '../db/models';
+import {
+  CategoryModel,
+  OrderModel,
+  ProductModel,
+  PromotionModel,
+  ServerCartModel,
+  type Order,
+} from '../db/models';
+import { customerCsrfProtection, requireCustomer } from '../middleware/auth';
 import { AppError, notFound } from '../lib/errors';
 import { parseInput } from '../lib/validate';
 import { imageDTO } from '../media/serialize';
@@ -30,7 +38,7 @@ import {
   relatedProducts,
 } from './catalog/product.service';
 import { publicOrderDTO } from './orders/order.serialize';
-import { createOrder, orderAccessToken, verifyOrderAccessToken } from './orders/order.service';
+import { createOrder, verifyOrderAccessToken } from './orders/order.service';
 import {
   getHomeContent,
   getStoreSettings,
@@ -212,27 +220,37 @@ export function publicRoutes(ctx: AppContext, limiter: LimiterFactory): Router {
     res.json({ data });
   });
 
-  router.post('/orders', orderLimiter, async (req, res) => {
-    const rawKey = req.get('idempotency-key');
-    const idempotencyKey = rawKey ? parseInput(idempotencyKeySchema, rawKey) : null;
-    const input = parseInput(checkoutSchema, req.body);
-    const { order, replayed } = await createOrder(ctx, input, idempotencyKey);
-    const settings = await getStoreSettings();
-    const data: CreateOrderResponse = {
-      order: publicOrderDTO(order, ctx.storage, settings, ctx.config.whatsappNumber),
-      accessToken: orderAccessToken(ctx.config.appSecret, order.orderNumber),
-      replayed,
-    };
-    noStore(res);
-    res.status(replayed ? 200 : 201).json({ data });
-  });
+  router.post(
+    '/orders',
+    orderLimiter,
+    requireCustomer,
+    customerCsrfProtection(ctx.config),
+    async (req, res) => {
+      const rawKey = req.get('idempotency-key');
+      const idempotencyKey = rawKey ? parseInput(idempotencyKeySchema, rawKey) : null;
+      const input = parseInput(checkoutSchema, req.body);
+      const { order, replayed } = await createOrder(ctx, input, idempotencyKey, req.customer!.id);
+      if (!replayed)
+        await ServerCartModel.updateOne({ account: req.customer!.id }, { $set: { items: [] } });
+      const settings = await getStoreSettings();
+      const data: CreateOrderResponse = {
+        order: publicOrderDTO(order, ctx.storage, settings, ctx.config.whatsappNumber),
+        replayed,
+      };
+      noStore(res);
+      res.status(replayed ? 200 : 201).json({ data });
+    },
+  );
 
   // POST so the phone number travels in the body and never appears in URLs or access logs.
   router.post('/orders/track', trackLimiter, async (req, res) => {
     const input = parseInput(orderTrackSchema, req.body);
+    // Orders owned by an account are only reachable through that signed-in account; this
+    // phone-based lookup serves legacy guest orders alone.
     const order = await OrderModel.findOne({
       orderNumber: input.orderNumber,
       'customer.phone': input.phone,
+      accountId: null,
     }).lean<Order>();
     if (!order)
       throw new AppError(
@@ -251,7 +269,7 @@ export function publicRoutes(ctx: AppContext, limiter: LimiterFactory): Router {
     if (!token || !verifyOrderAccessToken(ctx.config.appSecret, orderNumber, token)) {
       throw new AppError(404, 'ORDER_NOT_FOUND', 'Order not found.');
     }
-    const order = await OrderModel.findOne({ orderNumber }).lean<Order>();
+    const order = await OrderModel.findOne({ orderNumber, accountId: null }).lean<Order>();
     if (!order) throw new AppError(404, 'ORDER_NOT_FOUND', 'Order not found.');
     const settings = await getStoreSettings();
     noStore(res);

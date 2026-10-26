@@ -204,4 +204,64 @@ describe('image upload pipeline', () => {
       });
     expect(response.status).toBe(403);
   });
+
+  describe('re-cropping an existing image', () => {
+    async function uploadReady(width = 1600, height = 1200) {
+      const upload = await pm
+        .upload('/api/v1/admin/media')
+        .field('alt', 'Original pot')
+        .attach('file', await makeTestImage(width, height), {
+          filename: 'pot.jpg',
+          contentType: 'image/jpeg',
+        });
+      return waitUntilProcessed(upload.body.data.id);
+    }
+
+    it('builds a new asset from the stored image and leaves the original untouched', async () => {
+      const original = await uploadReady();
+      // The editor shows the largest variant (1600×1200), so crop coordinates are in that space.
+      expect([original.width, original.height]).toEqual([1600, 1200]);
+      const response = await pm.post(`/api/v1/admin/media/${original.id}/recrop`, {
+        crop: { x: 100, y: 50, width: 700, height: 700, rotation: 0 },
+      });
+      expect(response.status).toBe(202);
+      expect(response.body.data.id).not.toBe(original.id);
+      const recropped = await waitUntilProcessed(response.body.data.id);
+      expect(recropped).toMatchObject({
+        status: 'ready',
+        width: 700,
+        height: 700,
+        alt: 'Original pot',
+      });
+      const after = (await pm.get(`/api/v1/admin/media/${original.id}`)).body.data;
+      expect(after.variants).toEqual(original.variants);
+    });
+
+    it('applies rotation and a new alt text', async () => {
+      const original = await uploadReady();
+      const response = await pm.post(`/api/v1/admin/media/${original.id}/recrop`, {
+        crop: { x: 0, y: 0, width: 1200, height: 1600, rotation: 90 },
+        alt: 'Rotated',
+      });
+      const recropped = await waitUntilProcessed(response.body.data.id);
+      expect(recropped).toMatchObject({ width: 1200, height: 1600, alt: 'Rotated' });
+    });
+
+    it('rejects unknown images, tiny crops and anonymous callers', async () => {
+      const original = await uploadReady();
+      expect(
+        (await pm.post('/api/v1/admin/media/6a0000000000000000000000/recrop', {})).status,
+      ).toBe(404);
+      const tiny = await pm.post(`/api/v1/admin/media/${original.id}/recrop`, {
+        crop: { x: 0, y: 0, width: 50, height: 50, rotation: 0 },
+      });
+      expect(tiny.status).toBe(400);
+      const anonymous = await harness
+        .request()
+        .post(`/api/v1/admin/media/${original.id}/recrop`)
+        .set('Origin', 'http://localhost:3000')
+        .send({});
+      expect(anonymous.status).toBe(401);
+    });
+  });
 });

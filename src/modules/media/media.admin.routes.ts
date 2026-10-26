@@ -23,6 +23,7 @@ import {
   deleteAsset,
   findOrphanedAssets,
   CLIENT_UPLOAD_PREFIX,
+  recropAsset,
   takeClientUpload,
 } from '../../media/media.service';
 import { mediaAssetDTO } from '../../media/serialize';
@@ -118,6 +119,25 @@ export function mediaAdminRoutes(ctx: AppContext, limiter: LimiterFactory): Rout
       res.status(202).json({ data: mediaAssetDTO(asset, ctx.storage, 0) });
     },
   );
+
+  router.post('/:id/recrop', requirePermission('media:write'), uploadLimiter, async (req, res) => {
+    const id = parseInput(objectIdSchema, req.params.id);
+    const input = parseInput(
+      z.object({
+        crop: mediaCropSchema.nullable().default(null),
+        alt: z.string().trim().max(200).optional(),
+      }),
+      req.body,
+    );
+    const asset = await recropAsset(ctx, id, { ...input, actorId: req.admin!.id });
+    await audit(req, {
+      action: 'media.recrop',
+      entityType: 'media',
+      entityId: asset._id.toString(),
+      summary: `Re-cropped image “${asset.originalFilename}” into a new image`,
+    });
+    res.status(202).json({ data: mediaAssetDTO(asset, ctx.storage, 0) });
+  });
 
   router.get('/', requirePermission('media:read'), async (req, res) => {
     const query = parseInput(mediaListQuerySchema, req.query);

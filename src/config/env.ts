@@ -205,6 +205,7 @@ function buildConfig(source: NodeJS.ProcessEnv) {
       secure: cookieSecure,
       // __Host- cookies must be Secure, host-only and Path=/ — the browser enforces it.
       sessionName: cookieSecure ? '__Host-jmh_session' : 'jmh_session',
+      customerName: cookieSecure ? '__Host-jmh_customer' : 'jmh_customer',
     },
     session: {
       ttlMs: env.SESSION_TTL_HOURS * 3_600_000,

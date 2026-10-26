@@ -22,6 +22,8 @@ export interface Storage {
   putPublic(key: string, body: Buffer, contentType: string): Promise<void>;
   putPrivate(key: string, body: Buffer, contentType: string): Promise<void>;
   getPrivate(key: string): Promise<Buffer>;
+  /** Reads a processed public file back (used to re-crop an existing image). */
+  getPublic(key: string): Promise<Buffer>;
   deletePublic(keys: string[]): Promise<void>;
   deletePrivate(keys: string[]): Promise<void>;
   publicUrl(key: string): string;
@@ -71,6 +73,11 @@ class LocalStorage implements Storage {
   async getPrivate(key: string): Promise<Buffer> {
     assertSafeKey(key);
     return fs.readFile(path.join(this.privateDir, key));
+  }
+
+  async getPublic(key: string): Promise<Buffer> {
+    assertSafeKey(key);
+    return fs.readFile(path.join(this.publicDir, key));
   }
 
   private async remove(baseDir: string, keys: string[]): Promise<void> {
@@ -157,6 +164,15 @@ class S3Storage implements Storage {
     assertSafeKey(key);
     const response = await this.client.send(
       new GetObjectCommand({ Bucket: this.bucket, Key: `private/${key}` }),
+    );
+    if (!response.Body) throw new Error(`Empty object: ${key}`);
+    return Buffer.from(await response.Body.transformToByteArray());
+  }
+
+  async getPublic(key: string): Promise<Buffer> {
+    assertSafeKey(key);
+    const response = await this.client.send(
+      new GetObjectCommand({ Bucket: this.bucket, Key: `public/${key}` }),
     );
     if (!response.Body) throw new Error(`Empty object: ${key}`);
     return Buffer.from(await response.Body.transformToByteArray());
@@ -252,6 +268,13 @@ class BlobStorage implements Storage {
     });
     if (!result?.stream) throw new Error(`Missing object: ${key}`);
     return Buffer.from(await new Response(result.stream).arrayBuffer());
+  }
+
+  async getPublic(key: string): Promise<Buffer> {
+    assertSafeKey(key);
+    const response = await fetch(this.publicUrl(key), { cache: 'no-store' });
+    if (!response.ok) throw new Error(`Missing object: ${key} (${response.status})`);
+    return Buffer.from(await response.arrayBuffer());
   }
 
   async deletePublic(keys: string[]): Promise<void> {

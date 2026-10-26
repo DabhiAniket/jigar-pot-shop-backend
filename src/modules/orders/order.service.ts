@@ -7,6 +7,7 @@ import {
   transitionRestocksInventory,
   type CheckoutInput,
   type OrderStatus,
+  type ShipmentInput,
 } from '@jmh/shared';
 import type { AppContext } from '../../context';
 import { runTransaction } from '../../db/transaction';
@@ -20,7 +21,13 @@ import {
   type StoreSettingsDoc,
 } from '../../db/models';
 import { canonicalHash, hmac, readableCode, safeEqual } from '../../lib/crypto';
-import { AppError, conflict, isDuplicateKeyError, notFound } from '../../lib/errors';
+import {
+  AppError,
+  conflict,
+  isDuplicateKeyError,
+  notFound,
+  validationFailed,
+} from '../../lib/errors';
 import { logger } from '../../lib/logger';
 import type { AuthenticatedAdmin } from '../../types/express';
 import {
@@ -111,11 +118,13 @@ export async function createOrder(
   ctx: AppContext,
   input: CheckoutInput,
   idempotencyKey: string | null,
+  /** From the verified session, never from the request body. */
+  accountId: Types.ObjectId,
 ): Promise<CreateOrderResult> {
   const requestHash = canonicalHash(input);
   if (idempotencyKey) {
     const existing = await OrderModel.findOne({ idempotencyKey }).lean<Order>();
-    if (existing) return replay(existing, requestHash);
+    if (existing) return replay(existing, requestHash, accountId);
   }
 
   const settings = await getStoreSettings();
@@ -123,7 +132,14 @@ export async function createOrder(
     const orderNumber = generateOrderNumber(ctx.config.orderNumberPrefix);
     try {
       const order = await runTransaction((session) =>
-        placeOrder(input, { orderNumber, idempotencyKey, requestHash, settings, session }),
+        placeOrder(input, {
+          orderNumber,
+          idempotencyKey,
+          requestHash,
+          settings,
+          session,
+          accountId,
+        }),
       );
       return { order, replayed: false };
     } catch (error) {
@@ -133,7 +149,7 @@ export async function createOrder(
       }
       if (idempotencyKey && isDuplicateKeyError(error, 'idempotencyKey')) {
         const existing = await OrderModel.findOne({ idempotencyKey }).lean<Order>();
-        if (existing) return replay(existing, requestHash);
+        if (existing) return replay(existing, requestHash, accountId);
       }
       throw error;
     }
@@ -145,7 +161,19 @@ export async function createOrder(
   );
 }
 
-function replay(existing: Order, requestHash: string): CreateOrderResult {
+function replay(
+  existing: Order,
+  requestHash: string,
+  accountId: Types.ObjectId,
+): CreateOrderResult {
+  // An idempotency key must never hand one customer another customer's order.
+  if (!existing.accountId || !existing.accountId.equals(accountId)) {
+    throw new AppError(
+      422,
+      'IDEMPOTENCY_KEY_REUSED',
+      'This checkout was already submitted with different details. Please refresh the page and try again.',
+    );
+  }
   if (existing.requestHash && existing.requestHash !== requestHash) {
     throw new AppError(
       422,
@@ -164,6 +192,7 @@ async function placeOrder(
     requestHash: string;
     settings: StoreSettingsDoc;
     session: ClientSession;
+    accountId: Types.ObjectId;
   },
 ): Promise<Order> {
   const { session, settings } = meta;
@@ -285,6 +314,7 @@ async function placeOrder(
         fulfillment: input.fulfillment,
         customer: input.customer,
         customerId: customer._id,
+        accountId: meta.accountId,
         address: input.fulfillment === 'delivery' ? input.address : null,
         notes: input.notes ?? null,
         items,
@@ -382,7 +412,12 @@ async function restockOrder(
 
 export async function updateOrderStatus(
   orderId: string,
-  input: { status: OrderStatus; note?: string; cancellationReason?: string },
+  input: {
+    status: OrderStatus;
+    note?: string;
+    cancellationReason?: string;
+    shipment?: ShipmentInput;
+  },
   actor: AuthenticatedAdmin,
 ): Promise<Order> {
   return runTransaction(async (session) => {
@@ -395,13 +430,56 @@ export async function updateOrderStatus(
         `An order cannot move from “${order.status}” to “${input.status}”.`,
       );
     }
+    const shipment = input.shipment ?? null;
+    if (
+      input.status === 'shipped' &&
+      order.fulfillment === 'delivery' &&
+      !shipment &&
+      !order.shipment
+    ) {
+      throw validationFailed(
+        { shipment: ['Add the shipping provider and tracking number before marking it shipped.'] },
+        'Add the shipping provider and tracking number before marking it shipped.',
+      );
+    }
     const now = new Date();
     const restock =
       transitionRestocksInventory(input.status) &&
       order.inventory.committed &&
       !order.inventory.restockedAt;
     const set: Record<string, unknown> = { status: input.status };
-    if (input.status === 'cancelled') set.cancellationReason = input.cancellationReason ?? null;
+    if (shipment) {
+      set.shipment = {
+        ...shipment,
+        shippedAt: order.shipment?.shippedAt ?? now,
+        updatedBy: actor.id,
+      };
+    }
+    const request = order.cancellationRequest;
+    const requestOpen = request?.status === 'requested';
+    if (input.status === 'cancelled') {
+      set.cancellationReason = input.cancellationReason ?? null;
+      // Staff cancelling on their own is "admin"; approving the customer's ask is recorded as such.
+      set.cancelledBy = {
+        kind: requestOpen ? 'customer_request' : 'admin',
+        by: actor.id,
+        byName: actor.name,
+        at: now,
+      };
+    }
+    if (requestOpen) {
+      set.cancellationRequest = {
+        ...request,
+        status: input.status === 'cancelled' ? 'approved' : 'rejected',
+        resolvedAt: now,
+        resolvedBy: actor.id,
+        resolvedByName: actor.name,
+        resolutionNote:
+          input.status === 'cancelled'
+            ? null
+            : `The order moved to “${input.status}” before the request could be approved.`,
+      };
+    }
     if (restock) set['inventory.restockedAt'] = now;
 
     // Guard on the status we read, so two admins cannot apply conflicting transitions.
@@ -427,6 +505,112 @@ export async function updateOrderStatus(
     if (restock) await restockOrder(order, actor, session);
     return (await OrderModel.findById(order._id).session(session).lean<Order>())!;
   });
+}
+
+/** Fixes or adds shipment details once an order is ready to leave (or has left). */
+export async function setShipment(
+  orderId: string,
+  input: ShipmentInput,
+  actor: AuthenticatedAdmin,
+): Promise<Order> {
+  const order = await OrderModel.findById(orderId).lean<Order>();
+  if (!order) throw notFound('Order');
+  if (!['ready_for_dispatch', 'shipped', 'delivered'].includes(order.status))
+    throw conflict('Shipment details can be added once the order is ready for dispatch.');
+  const updated = await OrderModel.findOneAndUpdate(
+    { _id: order._id, status: order.status },
+    {
+      $set: {
+        shipment: {
+          ...input,
+          shippedAt: order.shipment?.shippedAt ?? new Date(),
+          updatedBy: actor.id,
+        },
+      },
+    },
+    { returnDocument: 'after' },
+  ).lean<Order>();
+  if (!updated)
+    throw conflict('This order was just updated by someone else. Refresh and try again.');
+  return updated;
+}
+
+/**
+ * Orders are looked up by number AND owner in one query: another customer's order is
+ * indistinguishable from a missing one (404), so nothing leaks through error differences.
+ */
+export async function findOwnOrder(accountId: Types.ObjectId, orderNumber: string): Promise<Order> {
+  const order = await OrderModel.findOne({ orderNumber, accountId }).lean<Order>();
+  if (!order) throw notFound('Order');
+  return order;
+}
+
+const CUSTOMER_CANCELLABLE_STATUSES: OrderStatus[] = [
+  'pending',
+  'awaiting_confirmation',
+  'confirmed',
+  'processing',
+];
+
+/** The customer asks; staff decide. One request per order keeps the history intact. */
+export async function requestCancellation(
+  accountId: Types.ObjectId,
+  orderNumber: string,
+  reason: string,
+): Promise<Order> {
+  const order = await findOwnOrder(accountId, orderNumber);
+  const updated = await OrderModel.findOneAndUpdate(
+    {
+      _id: order._id,
+      accountId,
+      status: { $in: CUSTOMER_CANCELLABLE_STATUSES },
+      cancellationRequest: null,
+    },
+    {
+      $set: {
+        cancellationRequest: {
+          status: 'requested',
+          reason,
+          requestedAt: new Date(),
+          resolvedAt: null,
+          resolvedBy: null,
+          resolvedByName: null,
+          resolutionNote: null,
+        },
+      },
+    },
+    { returnDocument: 'after' },
+  ).lean<Order>();
+  if (!updated)
+    throw conflict(
+      order.cancellationRequest
+        ? 'A cancellation request was already made for this order.'
+        : 'This order can no longer be cancelled online. Please contact the store.',
+      'CANCELLATION_NOT_ALLOWED',
+    );
+  return updated;
+}
+
+export async function rejectCancellationRequest(
+  orderId: string,
+  note: string,
+  actor: AuthenticatedAdmin,
+): Promise<Order> {
+  const updated = await OrderModel.findOneAndUpdate(
+    { _id: orderId, 'cancellationRequest.status': 'requested' },
+    {
+      $set: {
+        'cancellationRequest.status': 'rejected',
+        'cancellationRequest.resolvedAt': new Date(),
+        'cancellationRequest.resolvedBy': actor.id,
+        'cancellationRequest.resolvedByName': actor.name,
+        'cancellationRequest.resolutionNote': note,
+      },
+    },
+    { returnDocument: 'after' },
+  ).lean<Order>();
+  if (!updated) throw conflict('There is no open cancellation request on this order.');
+  return updated;
 }
 
 export async function addInternalNote(
