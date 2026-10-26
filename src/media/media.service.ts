@@ -110,6 +110,32 @@ export async function createUpload(
   return asset.toObject();
 }
 
+/**
+ * Crops an already processed image again without re-uploading it: the new asset is built from
+ * the stored large WebP variant, so the existing image (and everything using it) stays untouched.
+ */
+export async function recropAsset(
+  ctx: AppContext,
+  assetId: string,
+  input: { crop: MediaCrop | null; alt?: string; actorId: Types.ObjectId | null },
+): Promise<MediaAsset> {
+  const asset = await MediaAssetModel.findById(assetId).lean();
+  if (!asset) throw notFound('Image');
+  const largest = asset.variants.reduce<(typeof asset.variants)[number] | null>(
+    (best, variant) => (!best || variant.width > best.width ? variant : best),
+    null,
+  );
+  if (asset.status !== 'ready' || !largest)
+    throw conflict('Only processed images can be edited.', 'MEDIA_NOT_READY');
+  return createUpload(ctx, {
+    buffer: await ctx.storage.getPublic(largest.key),
+    originalName: asset.originalFilename,
+    crop: input.crop,
+    alt: input.alt ?? asset.alt,
+    actorId: input.actorId,
+  });
+}
+
 /** Job handler: converts the stored original into WebP variants. Safe to run more than once. */
 export async function processAsset(
   ctx: AppContext,

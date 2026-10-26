@@ -344,7 +344,6 @@ export interface PublicOrderDTO {
 
 export interface CreateOrderResponse {
   order: PublicOrderDTO;
-  accessToken: string;
   /** True when the request was a retry of an order that already exists. */
   replayed: boolean;
 }
@@ -361,6 +360,7 @@ export interface AdminOrderListItem {
   itemCount: number;
   total: Paise;
   createdAt: string;
+  cancellationRequest: CancellationRequestStatus | null;
 }
 
 export interface AdminOrderDetail {
@@ -378,6 +378,11 @@ export interface AdminOrderDetail {
   statusHistory: OrderStatusEventDTO[];
   internalNotes: { text: string; at: string; byName: string }[];
   cancellationReason: string | null;
+  cancelledBy: { kind: CancelledBy; byName: string | null; at: string } | null;
+  cancellationRequest: (CancellationRequestDTO & { resolvedByName: string | null }) | null;
+  shipment: ShipmentDTO | null;
+  /** Orders placed by a signed-in customer carry the account id; legacy guest orders do not. */
+  hasAccount: boolean;
   inventory: { committed: boolean; restockedAt: string | null };
   whatsappContactUrl: string | null;
   createdAt: string;
@@ -617,4 +622,71 @@ export interface DashboardDTO {
     recentOrders: AdminOrderListItem[];
     topProducts: { productId: string; name: string; quantity: number; revenue: Paise }[];
   } | null;
+}
+
+// ── Customer accounts, server cart, own-order views ──
+
+export interface SavedAddressDTO extends OrderAddressDTO {
+  id: string;
+  label: string | null;
+  isDefault: boolean;
+}
+
+export interface CustomerMe {
+  id: string;
+  name: string;
+  email: string;
+  phone: string;
+  addresses: SavedAddressDTO[];
+  csrfToken: string;
+}
+
+export interface ShipmentDTO {
+  provider: string;
+  trackingNumber: string;
+  trackingUrl: string | null;
+  shippedAt: string;
+  estimatedDelivery: string | null;
+  notes: string | null;
+}
+
+export type CancellationRequestStatus = 'requested' | 'approved' | 'rejected';
+
+export interface CancellationRequestDTO {
+  status: CancellationRequestStatus;
+  reason: string;
+  requestedAt: string;
+  resolvedAt: string | null;
+  /** Visible to the customer: why a request was rejected. */
+  resolutionNote: string | null;
+}
+
+/** Who ended the order: staff directly, or staff approving the customer's own request. */
+export type CancelledBy = 'admin' | 'customer_request';
+
+export interface CustomerOrderListItem {
+  orderNumber: string;
+  status: OrderStatus;
+  createdAt: string;
+  total: Paise;
+  itemCount: number;
+  firstItem: { name: string; image: string | null } | null;
+  cancellationRequest: CancellationRequestStatus | null;
+}
+
+export interface CustomerOrderDTO extends PublicOrderDTO {
+  timeline: { status: OrderStatus; at: string; note: string | null }[];
+  shipment: ShipmentDTO | null;
+  cancellationRequest: CancellationRequestDTO | null;
+  cancelledBy: CancelledBy | null;
+  cancellationReason: string | null;
+  /** True while the customer may still ask for cancellation. */
+  canRequestCancellation: boolean;
+  /** No online payment is processed; payment is arranged with the store (WhatsApp or on pickup). */
+  payment: { method: 'offline'; status: 'not_processed_online' | 'refunded'; note: string };
+}
+
+export interface ServerCartDTO {
+  items: { productId: string; variantId: string | null; quantity: number }[];
+  quote: CartQuote | null;
 }

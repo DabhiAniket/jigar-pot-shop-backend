@@ -230,3 +230,47 @@ export function checkoutBody(
     ...overrides,
   };
 }
+
+export interface SignedInCustomer {
+  agent: TestAgent;
+  csrf: string;
+  id: string;
+  email: string;
+}
+
+let customerCounter = 0;
+
+/** Registers a real customer account through the API and returns its signed-in agent. */
+export async function registerCustomer(
+  harness: Harness,
+  overrides: { name?: string; email?: string; phone?: string } = {},
+): Promise<SignedInCustomer> {
+  const email =
+    overrides.email ??
+    `customer${++customerCounter}-${Math.random().toString(36).slice(2, 7)}@example.com`;
+  const agent = harness.request();
+  const response = await agent
+    .post('/api/v1/account/register')
+    .set('Origin', ORIGIN)
+    .send({
+      name: overrides.name ?? 'Riya Patel',
+      email,
+      phone: overrides.phone ?? '9876543210',
+      password: STRONG_PASSWORD,
+    });
+  if (response.status !== 201) throw new Error(`register failed: ${JSON.stringify(response.body)}`);
+  return { agent, csrf: response.body.data.csrfToken, id: response.body.data.id, email };
+}
+
+/** Mutating calls carry the Origin and CSRF headers a browser would send. */
+export function customerClient(customer: SignedInCustomer) {
+  const withHeaders = <T extends { set: (k: string, v: string) => T }>(req: T) =>
+    req.set('Origin', ORIGIN).set('X-CSRF-Token', customer.csrf);
+  return {
+    get: (url: string) => customer.agent.get(url),
+    post: (url: string, body?: object) => withHeaders(customer.agent.post(url)).send(body ?? {}),
+    put: (url: string, body?: object) => withHeaders(customer.agent.put(url)).send(body ?? {}),
+    patch: (url: string, body?: object) => withHeaders(customer.agent.patch(url)).send(body ?? {}),
+    delete: (url: string) => withHeaders(customer.agent.delete(url)),
+  };
+}

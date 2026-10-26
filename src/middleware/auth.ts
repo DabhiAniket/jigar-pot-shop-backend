@@ -3,6 +3,7 @@ import { hasPermission, type Permission } from '@jmh/shared';
 import type { AppConfig } from '../config/env';
 import { safeEqual } from '../lib/crypto';
 import { forbidden, unauthorized } from '../lib/errors';
+import { customerCsrfTokenFor, resolveCustomerSession } from '../modules/account/account.service';
 import { csrfTokenFor, resolveSession } from '../modules/auth/auth.service';
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
@@ -91,4 +92,44 @@ export function requirePermission(...permissions: Permission[]): RequestHandler 
 
 export function clientIp(req: Request): string | null {
   return req.ip ?? null;
+}
+
+/** Attaches req.customer from the customer session cookie. Never rejects on its own. */
+export function loadCustomerSession(config: AppConfig): RequestHandler {
+  return async (req, _res, next) => {
+    const token = req.cookies?.[config.cookies.customerName];
+    if (typeof token === 'string' && token) {
+      const customer = await resolveCustomerSession(config, token);
+      if (customer) req.customer = customer;
+    }
+    next();
+  };
+}
+
+/** The only way an order/cart route learns who the caller is: the verified session. */
+export const requireCustomer: RequestHandler = (req, _res, next) => {
+  if (!req.customer) throw unauthorized();
+  next();
+};
+
+const CUSTOMER_CSRF_EXEMPT = new Set(['/login', '/register']);
+
+/** Double-submit CSRF for cookie-authenticated customer mutations. */
+export function customerCsrfProtection(config: AppConfig): RequestHandler {
+  return (req, _res, next) => {
+    if (SAFE_METHODS.has(req.method) || !req.customer || CUSTOMER_CSRF_EXEMPT.has(req.path))
+      return next();
+    const provided = req.get('x-csrf-token') ?? '';
+    if (
+      !provided ||
+      !safeEqual(provided, customerCsrfTokenFor(config, req.customer.sessionTokenHash))
+    )
+      return next(
+        forbidden(
+          'Your session security token is missing or expired. Refresh the page and try again.',
+          'CSRF_FAILED',
+        ),
+      );
+    next();
+  };
 }

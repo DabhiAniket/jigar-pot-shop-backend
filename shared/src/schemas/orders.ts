@@ -118,11 +118,30 @@ export const orderTrackSchema = z.object({
   phone: indianMobileSchema,
 });
 
+const shipmentFields = z.object({
+  provider: requiredText(80, 'Shipping provider'),
+  trackingNumber: requiredText(80, 'Tracking number'),
+  trackingUrl: z
+    .url({ protocol: /^https?$/, error: 'Enter a valid tracking link' })
+    .max(300)
+    .nullish()
+    .transform((value) => value ?? null),
+  estimatedDelivery: z.iso
+    .date({ error: 'Use the format YYYY-MM-DD' })
+    .nullish()
+    .transform((value) => value ?? null),
+  notes: optionalText(300),
+});
+export const shipmentSchema = shipmentFields;
+export type ShipmentInput = z.infer<typeof shipmentSchema>;
+
 export const orderStatusUpdateSchema = z
   .object({
     status: z.enum(ORDER_STATUSES),
     note: optionalText(500),
     cancellationReason: optionalText(300),
+    /** Required when a home-delivery order is marked shipped (enforced by the API). */
+    shipment: shipmentFields.optional(),
   })
   .refine((value) => value.status !== 'cancelled' || value.cancellationReason, {
     path: ['cancellationReason'],
@@ -137,6 +156,8 @@ export const adminOrderListQuerySchema = z.object({
   q: searchQuerySchema,
   status: z.enum(ORDER_STATUSES).optional(),
   channel: z.enum(CHECKOUT_CHANNELS).optional(),
+  /** Only orders whose customer asked to cancel and is still waiting for an answer. */
+  cancellationRequest: z.enum(['requested']).optional(),
   from: dateQuerySchema,
   to: dateQuerySchema,
   page: pageQuerySchema,

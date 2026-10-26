@@ -7,6 +7,7 @@ export * from './pricing';
 export * from './slug';
 export * from './types';
 export * from './whatsapp';
+export * from './schemas/account';
 export * from './schemas/auth';
 export * from './schemas/catalog';
 export * from './schemas/common';

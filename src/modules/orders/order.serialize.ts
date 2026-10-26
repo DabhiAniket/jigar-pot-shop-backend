@@ -5,9 +5,13 @@ import {
   nextOrderStatuses,
   type AdminOrderDetail,
   type AdminOrderListItem,
+  type CancellationRequestDTO,
+  type CustomerOrderDTO,
+  type CustomerOrderListItem,
   type OrderItemDTO,
   type OrderPricingDTO,
   type PublicOrderDTO,
+  type ShipmentDTO,
 } from '@jmh/shared';
 import type { Order, StoreSettingsDoc } from '../../db/models';
 import type { Storage } from '../../storage/storage';
@@ -94,6 +98,83 @@ export function adminOrderListItem(order: Order): AdminOrderListItem {
     itemCount: order.items.reduce((sum, item) => sum + item.quantity, 0),
     total: order.pricing.total,
     createdAt: order.createdAt.toISOString(),
+    cancellationRequest: order.cancellationRequest?.status ?? null,
+  };
+}
+
+function shipmentDTO(order: Order): ShipmentDTO | null {
+  const shipment = order.shipment;
+  if (!shipment) return null;
+  return {
+    provider: shipment.provider,
+    trackingNumber: shipment.trackingNumber,
+    trackingUrl: shipment.trackingUrl,
+    shippedAt: shipment.shippedAt.toISOString(),
+    estimatedDelivery: shipment.estimatedDelivery,
+    notes: shipment.notes,
+  };
+}
+
+function cancellationRequestDTO(order: Order): CancellationRequestDTO | null {
+  const request = order.cancellationRequest;
+  if (!request) return null;
+  return {
+    status: request.status,
+    reason: request.reason,
+    requestedAt: request.requestedAt.toISOString(),
+    resolvedAt: request.resolvedAt?.toISOString() ?? null,
+    resolutionNote: request.resolutionNote,
+  };
+}
+
+/** Customers may ask to cancel until the order is on its way (staff handle anything later). */
+const CUSTOMER_CANCELLABLE = ['pending', 'awaiting_confirmation', 'confirmed', 'processing'];
+export function canRequestCancellation(order: Order): boolean {
+  return CUSTOMER_CANCELLABLE.includes(order.status) && !order.cancellationRequest;
+}
+
+export function customerOrderListItem(order: Order, storage: Storage): CustomerOrderListItem {
+  const first = order.items[0];
+  return {
+    orderNumber: order.orderNumber,
+    status: order.status,
+    createdAt: order.createdAt.toISOString(),
+    total: order.pricing.total,
+    itemCount: order.items.reduce((sum, item) => sum + item.quantity, 0),
+    firstItem: first
+      ? { name: first.name, image: first.imageKey ? storage.publicUrl(first.imageKey) : null }
+      : null,
+    cancellationRequest: order.cancellationRequest?.status ?? null,
+  };
+}
+
+/**
+ * What a customer sees of their OWN order. Deliberately omits internal notes, staff ids and
+ * names, inventory state and the idempotency data.
+ */
+export function customerOrderDTO(
+  order: Order,
+  storage: Storage,
+  settings: StoreSettingsDoc,
+  envWhatsapp: string | null,
+): CustomerOrderDTO {
+  return {
+    ...publicOrderDTO(order, storage, settings, envWhatsapp),
+    timeline: order.statusHistory.map((event) => ({
+      status: event.to,
+      at: event.at.toISOString(),
+      note: event.to === 'cancelled' || event.to === 'shipped' ? event.note : null,
+    })),
+    shipment: shipmentDTO(order),
+    cancellationRequest: cancellationRequestDTO(order),
+    cancelledBy: order.cancelledBy?.kind ?? null,
+    cancellationReason: order.cancellationReason,
+    canRequestCancellation: canRequestCancellation(order),
+    payment: {
+      method: 'offline',
+      status: order.status === 'refunded' ? 'refunded' : 'not_processed_online',
+      note: 'No online payment is taken. Payment is arranged directly with the store.',
+    },
   };
 }
 
@@ -137,6 +218,21 @@ export function adminOrderDetail(
       byName: note.byName,
     })),
     cancellationReason: order.cancellationReason,
+    cancelledBy: order.cancelledBy
+      ? {
+          kind: order.cancelledBy.kind,
+          byName: order.cancelledBy.byName,
+          at: order.cancelledBy.at.toISOString(),
+        }
+      : null,
+    cancellationRequest: order.cancellationRequest
+      ? {
+          ...cancellationRequestDTO(order)!,
+          resolvedByName: order.cancellationRequest.resolvedByName,
+        }
+      : null,
+    shipment: shipmentDTO(order),
+    hasAccount: Boolean(order.accountId),
     inventory: {
       committed: order.inventory.committed,
       restockedAt: order.inventory.restockedAt?.toISOString() ?? null,

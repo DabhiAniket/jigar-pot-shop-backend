@@ -3,6 +3,8 @@ import { Types, type QueryFilter } from 'mongoose';
 import {
   adminCustomerListQuerySchema,
   adminOrderListQuerySchema,
+  cancellationRejectSchema,
+  shipmentSchema,
   normalizeIndianMobile,
   objectIdSchema,
   orderNoteSchema,
@@ -20,7 +22,12 @@ import { requirePermission } from '../../middleware/auth';
 import { audit } from '../audit/audit.service';
 import { getStoreSettings } from '../settings/settings.service';
 import { adminOrderDetail, adminOrderListItem } from './order.serialize';
-import { addInternalNote, updateOrderStatus } from './order.service';
+import {
+  addInternalNote,
+  rejectCancellationRequest,
+  setShipment,
+  updateOrderStatus,
+} from './order.service';
 
 /** Interprets YYYY-MM-DD as a calendar day in India. */
 function istDayStart(day: string): Date {
@@ -35,6 +42,7 @@ export function ordersAdminRoutes(ctx: AppContext): Router {
     const filter: QueryFilter<Order> = {};
     if (query.status) filter.status = query.status;
     if (query.channel) filter.channel = query.channel;
+    if (query.cancellationRequest) filter['cancellationRequest.status'] = 'requested';
     if (query.from || query.to) {
       filter.createdAt = {
         ...(query.from ? { $gte: istDayStart(query.from) } : {}),
@@ -59,7 +67,7 @@ export function ordersAdminRoutes(ctx: AppContext): Router {
     const [orders, total] = await Promise.all([
       OrderModel.find(filter)
         .select(
-          'orderNumber status channel fulfillment customer address.city items.quantity pricing.total createdAt',
+          'orderNumber status channel fulfillment customer address.city items.quantity pricing.total createdAt cancellationRequest.status',
         )
         .sort({ createdAt: -1 })
         .skip((query.page - 1) * query.limit)
@@ -102,6 +110,38 @@ export function ordersAdminRoutes(ctx: AppContext): Router {
     const settings = await getStoreSettings();
     res.json({ data: adminOrderDetail(order, ctx.storage, settings) });
   });
+
+  router.put('/orders/:id/shipment', requirePermission('orders:write'), async (req, res) => {
+    const id = parseInput(objectIdSchema, req.params.id);
+    const input = parseInput(shipmentSchema, req.body);
+    const order = await setShipment(id, input, req.admin!);
+    await audit(req, {
+      action: 'order.shipment',
+      entityType: 'order',
+      entityId: id,
+      summary: `Set shipment for order ${order.orderNumber}: ${input.provider} ${input.trackingNumber}`,
+    });
+    const settings = await getStoreSettings();
+    res.json({ data: adminOrderDetail(order, ctx.storage, settings) });
+  });
+
+  router.post(
+    '/orders/:id/cancellation-request/reject',
+    requirePermission('orders:write'),
+    async (req, res) => {
+      const id = parseInput(objectIdSchema, req.params.id);
+      const { note } = parseInput(cancellationRejectSchema, req.body);
+      const order = await rejectCancellationRequest(id, note, req.admin!);
+      await audit(req, {
+        action: 'order.cancellation_rejected',
+        entityType: 'order',
+        entityId: id,
+        summary: `Rejected the cancellation request on order ${order.orderNumber}`,
+      });
+      const settings = await getStoreSettings();
+      res.json({ data: adminOrderDetail(order, ctx.storage, settings) });
+    },
+  );
 
   router.post('/orders/:id/notes', requirePermission('orders:write'), async (req, res) => {
     const id = parseInput(objectIdSchema, req.params.id);

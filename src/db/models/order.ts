@@ -1,6 +1,8 @@
 import { model, Schema, type HydratedDocument, type Types } from 'mongoose';
 import {
   CHECKOUT_CHANNELS,
+  type CancelledBy,
+  type CancellationRequestStatus,
   FULFILLMENT_METHODS,
   INVENTORY_REASONS,
   ORDER_STATUSES,
@@ -39,6 +41,26 @@ export interface OrderStatusEvent {
   byName: string | null;
 }
 
+export interface OrderShipment {
+  provider: string;
+  trackingNumber: string;
+  trackingUrl: string | null;
+  shippedAt: Date;
+  estimatedDelivery: string | null;
+  notes: string | null;
+  updatedBy: Types.ObjectId | null;
+}
+
+export interface OrderCancellationRequest {
+  status: CancellationRequestStatus;
+  reason: string;
+  requestedAt: Date;
+  resolvedAt: Date | null;
+  resolvedBy: Types.ObjectId | null;
+  resolvedByName: string | null;
+  resolutionNote: string | null;
+}
+
 export interface Order {
   _id: Types.ObjectId;
   orderNumber: string;
@@ -47,6 +69,8 @@ export interface Order {
   fulfillment: FulfillmentMethod;
   customer: { name: string; phone: string; whatsapp: string | null };
   customerId: Types.ObjectId | null;
+  /** The signed-in account that owns this order. Null only for legacy guest orders. */
+  accountId: Types.ObjectId | null;
   address: AddressSnapshot | null;
   notes: string | null;
   items: OrderItem[];
@@ -67,6 +91,14 @@ export interface Order {
   statusHistory: OrderStatusEvent[];
   internalNotes: { text: string; at: Date; by: Types.ObjectId; byName: string }[];
   cancellationReason: string | null;
+  cancelledBy: {
+    kind: CancelledBy;
+    by: Types.ObjectId | null;
+    byName: string | null;
+    at: Date;
+  } | null;
+  cancellationRequest: OrderCancellationRequest | null;
+  shipment: OrderShipment | null;
   inventory: { committed: boolean; restockedAt: Date | null };
   idempotencyKey: string | null;
   requestHash: string | null;
@@ -113,6 +145,7 @@ const orderSchema = new Schema<Order>(
       required: true,
     },
     customerId: { type: Schema.Types.ObjectId, ref: 'Customer', default: null },
+    accountId: { type: Schema.Types.ObjectId, ref: 'CustomerAccount', default: null },
     address: { type: addressSchema, default: null },
     notes: { type: String, default: null, maxlength: 500 },
     items: { type: [orderItemSchema], required: true },
@@ -168,6 +201,48 @@ const orderSchema = new Schema<Order>(
       default: [],
     },
     cancellationReason: { type: String, default: null },
+    cancelledBy: {
+      type: new Schema(
+        {
+          kind: { type: String, enum: ['admin', 'customer_request'], required: true },
+          by: { type: Schema.Types.ObjectId, default: null },
+          byName: { type: String, default: null },
+          at: { type: Date, required: true },
+        },
+        { _id: false },
+      ),
+      default: null,
+    },
+    cancellationRequest: {
+      type: new Schema(
+        {
+          status: { type: String, enum: ['requested', 'approved', 'rejected'], required: true },
+          reason: { type: String, required: true, maxlength: 300 },
+          requestedAt: { type: Date, required: true },
+          resolvedAt: { type: Date, default: null },
+          resolvedBy: { type: Schema.Types.ObjectId, default: null },
+          resolvedByName: { type: String, default: null },
+          resolutionNote: { type: String, default: null, maxlength: 300 },
+        },
+        { _id: false },
+      ),
+      default: null,
+    },
+    shipment: {
+      type: new Schema(
+        {
+          provider: { type: String, required: true, maxlength: 80 },
+          trackingNumber: { type: String, required: true, maxlength: 80 },
+          trackingUrl: { type: String, default: null, maxlength: 300 },
+          shippedAt: { type: Date, required: true },
+          estimatedDelivery: { type: String, default: null },
+          notes: { type: String, default: null, maxlength: 300 },
+          updatedBy: { type: Schema.Types.ObjectId, default: null },
+        },
+        { _id: false },
+      ),
+      default: null,
+    },
     inventory: {
       type: new Schema(
         {
@@ -192,6 +267,7 @@ orderSchema.index({ createdAt: -1 });
 orderSchema.index({ status: 1, createdAt: -1 });
 orderSchema.index({ 'customer.phone': 1, createdAt: -1 });
 orderSchema.index({ customerId: 1, createdAt: -1 });
+orderSchema.index({ accountId: 1, createdAt: -1 });
 
 export const OrderModel = model<Order>('Order', orderSchema);
 export type OrderDocument = HydratedDocument<Order>;

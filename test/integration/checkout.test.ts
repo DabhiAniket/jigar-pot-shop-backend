@@ -7,6 +7,7 @@ import {
   PromotionModel,
   StoreSettingsModel,
 } from '../../src/db/models';
+import { orderAccessToken } from '../../src/modules/orders/order.service';
 import { invalidateSettingsCache } from '../../src/modules/settings/settings.service';
 import {
   adminClient,
@@ -14,14 +15,18 @@ import {
   createCategory,
   createHarness,
   createPublishedProduct,
-  ORIGIN,
+  customerClient,
+  registerCustomer,
   signedInAs,
   type Harness,
+  type SignedInCustomer,
 } from '../helpers/harness';
 
 let harness: Harness;
+let buyer: SignedInCustomer;
 beforeAll(async () => {
   harness = await createHarness();
+  buyer = await registerCustomer(harness);
 });
 afterAll(async () => {
   await harness.close();
@@ -42,13 +47,8 @@ async function configureDelivery(delivery: {
 
 const address = { line1: '12 Shanti Nagar', city: 'Rajkot', state: 'Gujarat', pincode: '360001' };
 
-function placeOrder(body: object, key: string = randomUUID()) {
-  return harness
-    .request()
-    .post('/api/v1/orders')
-    .set('Origin', ORIGIN)
-    .set('Idempotency-Key', key)
-    .send(body);
+function placeOrder(body: object, key: string = randomUUID(), customer: SignedInCustomer = buyer) {
+  return customerClient(customer).post('/api/v1/orders', body).set('Idempotency-Key', key);
 }
 
 describe('cart quote', () => {
@@ -204,7 +204,7 @@ describe('order placement', () => {
       }),
     );
     expect(response.status).toBe(201);
-    const { order, accessToken, replayed } = response.body.data;
+    const { order, replayed } = response.body.data;
     expect(replayed).toBe(false);
     expect(order.orderNumber).toMatch(/^JMH-\d{6}-[0-9A-HJKMNP-TV-Z]{5}$/);
     expect(order.status).toBe('pending');
@@ -214,7 +214,7 @@ describe('order placement', () => {
       total: 1420_00,
     });
     expect(order.phoneMasked).toBe('+91 98•••••210');
-    expect(accessToken).toEqual(expect.any(String));
+    expect(response.body.data.accessToken).toBeUndefined();
 
     const saved = await OrderModel.findOne({ orderNumber: order.orderNumber }).lean();
     expect(saved?.customer).toMatchObject({
@@ -338,30 +338,62 @@ describe('order placement', () => {
     );
   });
 
-  it('protects the confirmation page with the access token and tracking with the phone number', async () => {
+  it('refuses checkout without a signed-in customer', async () => {
     const product = await createPublishedProduct(harness);
-    const { order, accessToken } = (
-      await placeOrder(checkoutBody([{ productId: product.id, quantity: 1 }]))
-    ).body.data;
-    expect(
-      (await harness.request().get(`/api/v1/orders/${order.orderNumber}?token=${accessToken}`))
-        .status,
-    ).toBe(200);
-    expect(
-      (await harness.request().get(`/api/v1/orders/${order.orderNumber}?token=wrong`)).status,
-    ).toBe(404);
-    expect((await harness.request().get(`/api/v1/orders/${order.orderNumber}`)).status).toBe(404);
+    const anonymous = await harness
+      .request()
+      .post('/api/v1/orders')
+      .set('Origin', 'http://localhost:3000')
+      .set('Idempotency-Key', randomUUID())
+      .send(checkoutBody([{ productId: product.id, quantity: 1 }]));
+    expect(anonymous.status).toBe(401);
+    expect(await OrderModel.countDocuments({ 'items.product': product.id })).toBe(0);
+  });
 
+  it('never serves an account-owned order through the legacy token or phone lookups', async () => {
+    const product = await createPublishedProduct(harness);
+    const { order } = (await placeOrder(checkoutBody([{ productId: product.id, quantity: 1 }])))
+      .body.data;
+    const token = orderAccessToken(harness.ctx.config.appSecret, order.orderNumber);
+    expect(
+      (await harness.request().get(`/api/v1/orders/${order.orderNumber}?token=${token}`)).status,
+    ).toBe(404);
     const tracked = await harness
       .request()
       .post('/api/v1/orders/track')
       .send({ orderNumber: order.orderNumber, phone: '9876543210' });
+    expect(tracked.status).toBe(404);
+  });
+
+  it('still serves legacy guest orders by token and by phone', async () => {
+    const product = await createPublishedProduct(harness);
+    const placed = (await placeOrder(checkoutBody([{ productId: product.id, quantity: 1 }]))).body
+      .data.order;
+    const source = (await OrderModel.findOne({ orderNumber: placed.orderNumber }).lean())!;
+    const { _id: _unused, ...rest } = source;
+    await OrderModel.create({
+      ...rest,
+      orderNumber: 'JMH-260101-ABCDE',
+      accountId: null,
+      idempotencyKey: null,
+    });
+    const token = orderAccessToken(harness.ctx.config.appSecret, 'JMH-260101-ABCDE');
+    expect(
+      (await harness.request().get(`/api/v1/orders/JMH-260101-ABCDE?token=${token}`)).status,
+    ).toBe(200);
+    expect(
+      (await harness.request().get('/api/v1/orders/JMH-260101-ABCDE?token=wrong')).status,
+    ).toBe(404);
+    expect((await harness.request().get('/api/v1/orders/JMH-260101-ABCDE')).status).toBe(404);
+    const tracked = await harness
+      .request()
+      .post('/api/v1/orders/track')
+      .send({ orderNumber: 'JMH-260101-ABCDE', phone: '9876543210' });
     expect(tracked.status).toBe(200);
-    expect(tracked.body.data.status).toBe('pending');
     const wrongPhone = await harness
       .request()
       .post('/api/v1/orders/track')
-      .send({ orderNumber: order.orderNumber, phone: '9876500000' });
+      .send({ orderNumber: 'JMH-260101-ABCDE', phone: '9876500000' });
     expect(wrongPhone.status).toBe(404);
   });
 });
