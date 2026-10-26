@@ -24,7 +24,7 @@ import {
   ServerCartModel,
   type Order,
 } from '../db/models';
-import { customerCsrfProtection, requireCustomer } from '../middleware/auth';
+import { customerCsrfProtection } from '../middleware/auth';
 import { AppError, notFound } from '../lib/errors';
 import { parseInput } from '../lib/validate';
 import { imageDTO } from '../media/serialize';
@@ -38,7 +38,7 @@ import {
   relatedProducts,
 } from './catalog/product.service';
 import { publicOrderDTO } from './orders/order.serialize';
-import { createOrder, verifyOrderAccessToken } from './orders/order.service';
+import { createOrder, orderAccessToken, verifyOrderAccessToken } from './orders/order.service';
 import {
   getHomeContent,
   getStoreSettings,
@@ -223,18 +223,25 @@ export function publicRoutes(ctx: AppContext, limiter: LimiterFactory): Router {
   router.post(
     '/orders',
     orderLimiter,
-    requireCustomer,
+    // CSRF applies only when a customer session cookie is present; guests have no session.
     customerCsrfProtection(ctx.config),
     async (req, res) => {
       const rawKey = req.get('idempotency-key');
       const idempotencyKey = rawKey ? parseInput(idempotencyKeySchema, rawKey) : null;
       const input = parseInput(checkoutSchema, req.body);
-      const { order, replayed } = await createOrder(ctx, input, idempotencyKey, req.customer!.id);
-      if (!replayed)
-        await ServerCartModel.updateOne({ account: req.customer!.id }, { $set: { items: [] } });
+      // A signed-in customer's order belongs to their account (the id comes from the session,
+      // never the body). Without a session it is a guest order, reachable only through its
+      // private access token or order number plus phone.
+      const accountId = req.customer?.id ?? null;
+      const { order, replayed } = await createOrder(ctx, input, idempotencyKey, accountId);
+      if (accountId && !replayed)
+        await ServerCartModel.updateOne({ account: accountId }, { $set: { items: [] } });
       const settings = await getStoreSettings();
       const data: CreateOrderResponse = {
         order: publicOrderDTO(order, ctx.storage, settings, ctx.config.whatsappNumber),
+        ...(accountId
+          ? {}
+          : { accessToken: orderAccessToken(ctx.config.appSecret, order.orderNumber) }),
         replayed,
       };
       noStore(res);

@@ -11,7 +11,7 @@ import {
   type ImageRef,
   type MediaAsset,
 } from '../db/models';
-import { conflict, notFound, validationFailed } from '../lib/errors';
+import { AppError, conflict, notFound, validationFailed } from '../lib/errors';
 import { logger } from '../lib/logger';
 import {
   ImageValidationError,
@@ -111,13 +111,118 @@ export async function createUpload(
 }
 
 /**
- * Crops an already processed image again without re-uploading it: the new asset is built from
- * the stored large WebP variant, so the existing image (and everything using it) stays untouched.
+ * Replaces the pictures behind an existing image record without touching the record's id, so
+ * every product, category and homepage section that uses it keeps working and shows the new
+ * picture. New sizes are written under a fresh revision path (the old files are kept), because
+ * image URLs are cached for a year: reusing a URL would leave visitors on the old picture.
+ * Nothing is switched until every new file is stored, so a failure leaves the image untouched.
  */
+export async function replaceAssetInPlace(
+  ctx: AppContext,
+  assetId: string,
+  input: { buffer: Buffer; originalName?: string; crop: MediaCrop | null; alt?: string },
+): Promise<MediaAsset> {
+  const asset = await MediaAssetModel.findById(assetId).lean();
+  if (!asset) throw notFound('Image');
+  if (asset.status !== 'ready')
+    throw conflict('Only processed images can be replaced.', 'MEDIA_NOT_READY');
+
+  let processed;
+  let inspected;
+  try {
+    inspected = await inspectImage(input.buffer, ctx.config.media.maxInputPixels);
+    processed = await processImage(input.buffer, normalizeCrop(input.crop, inspected), {
+      quality: ctx.config.media.webpQuality,
+      maxInputPixels: ctx.config.media.maxInputPixels,
+    });
+  } catch (error) {
+    if (error instanceof ImageValidationError)
+      throw validationFailed({ file: [error.message] }, error.message);
+    throw error;
+  }
+
+  const revision = asset.revision + 1;
+  const stored: string[] = [];
+  const variants = [];
+  try {
+    for (const variant of processed.variants) {
+      const key = `img/${asset._id.toString()}/r${revision}/${variant.name}-${variant.width}.webp`;
+      await ctx.storage.putPublic(key, variant.buffer, 'image/webp');
+      stored.push(key);
+      variants.push({
+        name: variant.name,
+        key,
+        width: variant.width,
+        height: variant.height,
+        bytes: variant.buffer.length,
+      });
+    }
+  } catch (error) {
+    await ctx.storage.deletePublic(stored).catch(() => undefined);
+    logger.error({ err: (error as Error).message, assetId }, 'image replace failed to store files');
+    throw new AppError(
+      502,
+      'MEDIA_STORAGE_FAILED',
+      'The new image could not be stored. Nothing was changed. Please try again.',
+    );
+  }
+
+  const fields = {
+    variants,
+    width: processed.width,
+    height: processed.height,
+    placeholder: processed.placeholder,
+  };
+  // Only the revision we read may be replaced: two admins cannot overwrite each other silently.
+  const swapped = await MediaAssetModel.updateOne(
+    { _id: asset._id, revision: asset.revision },
+    {
+      $set: {
+        ...fields,
+        revision,
+        crop: input.crop,
+        sourceFormat: inspected.format,
+        sourceBytes: input.buffer.length,
+        sourceWidth: inspected.width,
+        sourceHeight: inspected.height,
+        totalBytes: variants.reduce((sum, variant) => sum + variant.bytes, 0),
+        processedAt: new Date(),
+        ...(input.alt !== undefined ? { alt: input.alt } : {}),
+        ...(input.originalName ? { originalFilename: sanitizeFilename(input.originalName) } : {}),
+      },
+    },
+  );
+  if (swapped.modifiedCount !== 1) {
+    await ctx.storage.deletePublic(stored).catch(() => undefined);
+    throw conflict('This image was just changed by someone else. Reload and try again.');
+  }
+
+  // Denormalised copies in products, categories and the homepage. The old files still exist,
+  // so anything not yet updated keeps working. timestamps:false keeps product edit forms valid.
+  const pick = (prefix: string) =>
+    Object.fromEntries(Object.entries(fields).map(([key, value]) => [`${prefix}.${key}`, value]));
+  const options = { timestamps: false } as const;
+  await ProductModel.updateMany(
+    { 'images.asset': asset._id },
+    { $set: pick('images.$[e]') },
+    { ...options, arrayFilters: [{ 'e.asset': asset._id }] },
+  );
+  await CategoryModel.updateMany({ 'image.asset': asset._id }, { $set: pick('image') }, options);
+  await HomeContentModel.updateMany(
+    { 'hero.image.asset': asset._id },
+    { $set: pick('hero.image') },
+    options,
+  );
+  void ctx.cache.invalidate('catalog', 'home', 'settings');
+  ctx.revalidator.notify(['catalog', 'home']);
+  return (await MediaAssetModel.findById(asset._id).lean())!;
+}
+
+/** Crops the stored picture again, in place: the editor works on the largest stored size. */
 export async function recropAsset(
   ctx: AppContext,
   assetId: string,
-  input: { crop: MediaCrop | null; alt?: string; actorId: Types.ObjectId | null },
+  input: { crop: MediaCrop | null; alt?: string },
 ): Promise<MediaAsset> {
   const asset = await MediaAssetModel.findById(assetId).lean();
   if (!asset) throw notFound('Image');
@@ -127,12 +232,10 @@ export async function recropAsset(
   );
   if (asset.status !== 'ready' || !largest)
     throw conflict('Only processed images can be edited.', 'MEDIA_NOT_READY');
-  return createUpload(ctx, {
+  return replaceAssetInPlace(ctx, assetId, {
     buffer: await ctx.storage.getPublic(largest.key),
-    originalName: asset.originalFilename,
     crop: input.crop,
-    alt: input.alt ?? asset.alt,
-    actorId: input.actorId,
+    alt: input.alt,
   });
 }
 

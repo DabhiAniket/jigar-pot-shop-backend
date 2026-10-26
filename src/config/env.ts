@@ -183,6 +183,10 @@ function buildConfig(source: NodeJS.ProcessEnv) {
     appSecret: env.APP_SECRET,
     mongo: {
       uri: env.MONGODB_URI,
+      /** True for a database on this machine; used to stop local-disk images on a shared database. */
+      isLocal: /^mongodb:\/\/(?:[^@/]*@)?(localhost|127\.0\.0\.1|\[::1\])[:/,?]/.test(
+        env.MONGODB_URI,
+      ),
       maxPoolSize: env.MONGODB_MAX_POOL_SIZE,
       autoIndex: env.MONGODB_AUTO_INDEX ?? !isProd,
     },

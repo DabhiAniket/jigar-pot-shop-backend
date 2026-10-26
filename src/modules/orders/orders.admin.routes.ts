@@ -67,7 +67,7 @@ export function ordersAdminRoutes(ctx: AppContext): Router {
     const [orders, total] = await Promise.all([
       OrderModel.find(filter)
         .select(
-          'orderNumber status channel fulfillment customer address.city items.quantity pricing.total createdAt cancellationRequest.status',
+          'orderNumber status channel fulfillment customer address.city items.quantity pricing.total createdAt cancellationRequest.status shipment.trackingNumber',
         )
         .sort({ createdAt: -1 })
         .skip((query.page - 1) * query.limit)
