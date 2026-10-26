@@ -2,10 +2,12 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { MediaAssetModel } from '../../src/db/models';
+import { CategoryModel, MediaAssetModel, ProductModel } from '../../src/db/models';
 import {
   adminClient,
+  createCategory,
   createHarness,
+  createPublishedProduct,
   makeTestImage,
   signedInAs,
   type Harness,
@@ -205,7 +207,7 @@ describe('image upload pipeline', () => {
     expect(response.status).toBe(403);
   });
 
-  describe('re-cropping an existing image', () => {
+  describe('replacing and re-cropping an image in place', () => {
     async function uploadReady(width = 1600, height = 1200) {
       const upload = await pm
         .upload('/api/v1/admin/media')
@@ -217,37 +219,126 @@ describe('image upload pipeline', () => {
       return waitUntilProcessed(upload.body.data.id);
     }
 
-    it('builds a new asset from the stored image and leaves the original untouched', async () => {
-      const original = await uploadReady();
-      // The editor shows the largest variant (1600×1200), so crop coordinates are in that space.
-      expect([original.width, original.height]).toEqual([1600, 1200]);
-      const response = await pm.post(`/api/v1/admin/media/${original.id}/recrop`, {
-        crop: { x: 100, y: 50, width: 700, height: 700, rotation: 0 },
+    function fileOnDisk(key: string) {
+      return path.join(process.env.STORAGE_LOCAL_DIR!, 'public', key);
+    }
+
+    it('re-crops the same record: new revision, refs updated everywhere, old files kept', async () => {
+      const product = await createPublishedProduct(harness);
+      const assetId = product.images[0]!.asset.toString();
+      const category = await createCategory();
+      const before = (await MediaAssetModel.findById(assetId).lean())!;
+      await CategoryModel.updateOne(
+        { _id: category._id },
+        {
+          $set: {
+            image: {
+              asset: before._id,
+              alt: 'cat',
+              width: before.width,
+              height: before.height,
+              placeholder: before.placeholder,
+              variants: before.variants,
+            },
+          },
+        },
+      );
+      const productVersion = (await ProductModel.findById(product._id).lean())!.updatedAt;
+
+      const response = await pm.post(`/api/v1/admin/media/${assetId}/recrop`, {
+        crop: { x: 100, y: 50, width: 400, height: 400, rotation: 0 },
       });
-      expect(response.status).toBe(202);
-      expect(response.body.data.id).not.toBe(original.id);
-      const recropped = await waitUntilProcessed(response.body.data.id);
-      expect(recropped).toMatchObject({
+      expect(response.status).toBe(200);
+      expect(response.body.data).toMatchObject({
+        id: assetId,
         status: 'ready',
-        width: 700,
-        height: 700,
-        alt: 'Original pot',
+        width: 400,
+        height: 400,
       });
-      const after = (await pm.get(`/api/v1/admin/media/${original.id}`)).body.data;
-      expect(after.variants).toEqual(original.variants);
+
+      const after = (await MediaAssetModel.findById(assetId).lean())!;
+      expect(after.revision).toBe(1);
+      for (const variant of after.variants) {
+        expect(variant.key.startsWith(`img/${assetId}/r1/`)).toBe(true);
+        await fs.access(fileOnDisk(variant.key));
+      }
+      // The previous files are not deleted: old order snapshots and cached pages keep working.
+      for (const variant of before.variants) await fs.access(fileOnDisk(variant.key));
+
+      const updatedProduct = (await ProductModel.findById(product._id).lean())!;
+      expect(updatedProduct.images[0]!.variants.map((v) => v.key)).toEqual(
+        after.variants.map((v) => v.key),
+      );
+      expect(updatedProduct.images[0]!.width).toBe(400);
+      // Editing a product form open elsewhere must not hit a version conflict.
+      expect(updatedProduct.updatedAt.getTime()).toBe(productVersion.getTime());
+      const updatedCategory = (await CategoryModel.findById(category._id).lean())!;
+      expect(updatedCategory.image!.variants.map((v) => v.key)).toEqual(
+        after.variants.map((v) => v.key),
+      );
     });
 
-    it('applies rotation and a new alt text', async () => {
+    it('replaces the picture with a new upload and applies rotation and alt text', async () => {
       const original = await uploadReady();
-      const response = await pm.post(`/api/v1/admin/media/${original.id}/recrop`, {
-        crop: { x: 0, y: 0, width: 1200, height: 1600, rotation: 90 },
-        alt: 'Rotated',
+      const response = await pm
+        .upload(`/api/v1/admin/media/${original.id}/replace`)
+        .field('alt', 'Replacement')
+        .field('crop', JSON.stringify({ x: 0, y: 0, width: 600, height: 800, rotation: 90 }))
+        .attach('file', await makeTestImage(800, 600), {
+          filename: 'new.jpg',
+          contentType: 'image/jpeg',
+        });
+      expect(response.status).toBe(200);
+      expect(response.body.data).toMatchObject({
+        id: original.id,
+        alt: 'Replacement',
+        width: 600,
+        height: 800,
+        sourceWidth: 800,
       });
-      const recropped = await waitUntilProcessed(response.body.data.id);
-      expect(recropped).toMatchObject({ width: 1200, height: 1600, alt: 'Rotated' });
+      const sizes = response.body.data.variants.map((v: { name: string; width: number }) => v.name);
+      expect(sizes).toEqual(['thumb', 'card', 'standard']);
     });
 
-    it('rejects unknown images, tiny crops and anonymous callers', async () => {
+    it('leaves the image untouched when the new file is invalid or storage fails', async () => {
+      const original = await uploadReady();
+      const url = `/api/v1/admin/media/${original.id}/replace`;
+      const notImage = await pm.upload(url).attach('file', Buffer.from('not an image at all'), {
+        filename: 'x.jpg',
+        contentType: 'image/jpeg',
+      });
+      expect(notImage.status).toBe(400);
+      const tiny = await pm.upload(url).attach('file', await makeTestImage(100, 100), {
+        filename: 't.jpg',
+        contentType: 'image/jpeg',
+      });
+      expect(tiny.status).toBe(400);
+
+      const real = harness.ctx.storage.putPublic.bind(harness.ctx.storage);
+      let calls = 0;
+      harness.ctx.storage.putPublic = async (...args) => {
+        if (++calls === 2) throw new Error('storage down');
+        return real(...args);
+      };
+      const failed = await pm.upload(url).attach('file', await makeTestImage(900, 900), {
+        filename: 'f.jpg',
+        contentType: 'image/jpeg',
+      });
+      harness.ctx.storage.putPublic = real;
+      expect(failed.status).toBe(502);
+
+      const after = (await MediaAssetModel.findById(original.id).lean())!;
+      expect(after.revision).toBe(0);
+      expect(after.variants.map((v) => v.key)).toEqual(
+        original.variants.map((v: { url: string }) =>
+          new URL(v.url).pathname.replace(/^\/media\//, ''),
+        ),
+      );
+      // The half-written first file was cleaned up.
+      await expect(fs.access(fileOnDisk(`img/${original.id}/r1/thumb-240.webp`))).rejects.toThrow();
+    });
+
+    it('rejects unknown images, tiny crops, and callers without media permission', async () => {
       const original = await uploadReady();
       expect(
         (await pm.post('/api/v1/admin/media/6a0000000000000000000000/recrop', {})).status,
@@ -256,6 +347,18 @@ describe('image upload pipeline', () => {
         crop: { x: 0, y: 0, width: 50, height: 50, rotation: 0 },
       });
       expect(tiny.status).toBe(400);
+      const orders = adminClient(await signedInAs(harness, 'order_manager'));
+      expect((await orders.post(`/api/v1/admin/media/${original.id}/recrop`, {})).status).toBe(403);
+      expect(
+        (
+          await orders
+            .upload(`/api/v1/admin/media/${original.id}/replace`)
+            .attach('file', await makeTestImage(800, 600), {
+              filename: 'a.jpg',
+              contentType: 'image/jpeg',
+            })
+        ).status,
+      ).toBe(403);
       const anonymous = await harness
         .request()
         .post(`/api/v1/admin/media/${original.id}/recrop`)

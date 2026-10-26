@@ -493,6 +493,18 @@ describe('shipment and status rules (admin)', () => {
     expect(fixed.body.data.shipment.shippedAt).toBe(shipped.body.data.shipment.shippedAt);
   });
 
+  it('tells the order list what each order may do next, so rows can be actioned directly', async () => {
+    const mine = await aliceOrders('delivery');
+    const row = (await staff.get(`/api/v1/admin/orders?q=${mine.number}`)).body.data[0];
+    expect(row).toMatchObject({
+      orderNumber: mine.number,
+      status: 'pending',
+      fulfillment: 'delivery',
+      hasShipment: false,
+    });
+    expect(row.allowedTransitions).toEqual(['awaiting_confirmation', 'confirmed', 'cancelled']);
+  });
+
   it('rejects invalid status transitions and bad shipment links', async () => {
     const mine = await aliceOrders();
     const skip = await staff.post(`/api/v1/admin/orders/${mine.id}/status`, {

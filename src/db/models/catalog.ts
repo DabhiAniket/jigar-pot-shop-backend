@@ -70,6 +70,8 @@ export interface MediaAsset {
   incomingKey: string | null;
   /** Private storage key of the retained original (only when MEDIA_KEEP_ORIGINALS=true). */
   originalKey: string | null;
+  /** Bumped on every in-place replace; revision r > 0 files live under img/<id>/r<r>/. */
+  revision: number;
   error: string | null;
   attempts: number;
   processedAt: Date | null;
@@ -107,6 +109,7 @@ const mediaAssetSchema = new Schema<MediaAsset>(
     placeholder: { type: String, default: null },
     incomingKey: { type: String, default: null },
     originalKey: { type: String, default: null },
+    revision: { type: Number, default: 0 },
     error: { type: String, default: null },
     attempts: { type: Number, default: 0 },
     processedAt: { type: Date, default: null },

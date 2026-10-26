@@ -361,6 +361,9 @@ export interface AdminOrderListItem {
   total: Paise;
   createdAt: string;
   cancellationRequest: CancellationRequestStatus | null;
+  /** What this order may move to next, so the list can offer actions without opening the order. */
+  allowedTransitions: OrderStatus[];
+  hasShipment: boolean;
 }
 
 export interface AdminOrderDetail {
