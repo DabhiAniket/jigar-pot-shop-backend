@@ -1,4 +1,4 @@
-import { Router, type Request } from 'express';
+import { Router, type Request, type RequestHandler } from 'express';
 import { ipKeyGenerator } from 'express-rate-limit';
 import { handleUpload, type HandleUploadBody } from '@vercel/blob/client';
 import multer from 'multer';
@@ -13,7 +13,7 @@ import {
 import { z } from 'zod';
 import type { AppContext } from '../../context';
 import { MediaAssetModel, type MediaAsset } from '../../db/models';
-import { notFound, validationFailed } from '../../lib/errors';
+import { conflict, notFound, validationFailed } from '../../lib/errors';
 import { escapeRegex, parseInput } from '../../lib/validate';
 import { requirePermission } from '../../middleware/auth';
 import type { LimiterFactory } from '../../middleware/rate-limit';
@@ -32,6 +32,19 @@ import { audit } from '../audit/audit.service';
 
 export function mediaAdminRoutes(ctx: AppContext, limiter: LimiterFactory): Router {
   const router = Router();
+
+  /**
+   * Images saved to this machine's disk while the database is shared (e.g. production) would
+   * leave records pointing at files nobody else has: broken pictures on the live site.
+   */
+  const requireSafeStorage: RequestHandler = (_req, _res, next) => {
+    if (ctx.config.storage.driver === 'local' && !ctx.config.mongo.isLocal)
+      throw conflict(
+        'This server saves images on local disk but is connected to a remote database. Uploading or changing images is blocked so the live site is not left with missing pictures. Use a local database, or set STORAGE_DRIVER=blob.',
+        'STORAGE_MISMATCH',
+      );
+    next();
+  };
   const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: ctx.config.media.maxUploadBytes, files: 1, fields: 10, fieldSize: 4096 },
@@ -52,29 +65,36 @@ export function mediaAdminRoutes(ctx: AppContext, limiter: LimiterFactory): Rout
 
   // Step 1 of the large-file flow: hands the browser a short-lived token scoped to one pathname,
   // image types and the size cap. The read-write token itself never leaves the server.
-  router.post('/blob-token', requirePermission('media:write'), uploadLimiter, async (req, res) => {
-    const token = ctx.config.storage.blobToken;
-    if (!token) throw validationFailed({ file: ['Direct uploads are not available.'] });
-    const result = await handleUpload({
-      token,
-      request: req,
-      body: req.body as HandleUploadBody,
-      onBeforeGenerateToken: async (pathname) => {
-        if (!pathname.startsWith(CLIENT_UPLOAD_PREFIX) || pathname.includes('..'))
-          throw validationFailed({ file: ['Invalid upload path.'] });
-        return {
-          allowedContentTypes: [...ACCEPTED_IMAGE_MIME_TYPES],
-          maximumSizeInBytes: ctx.config.media.maxUploadBytes,
-          addRandomSuffix: true,
-        };
-      },
-    });
-    res.json(result);
-  });
+  router.post(
+    '/blob-token',
+    requirePermission('media:write'),
+    requireSafeStorage,
+    uploadLimiter,
+    async (req, res) => {
+      const token = ctx.config.storage.blobToken;
+      if (!token) throw validationFailed({ file: ['Direct uploads are not available.'] });
+      const result = await handleUpload({
+        token,
+        request: req,
+        body: req.body as HandleUploadBody,
+        onBeforeGenerateToken: async (pathname) => {
+          if (!pathname.startsWith(CLIENT_UPLOAD_PREFIX) || pathname.includes('..'))
+            throw validationFailed({ file: ['Invalid upload path.'] });
+          return {
+            allowedContentTypes: [...ACCEPTED_IMAGE_MIME_TYPES],
+            maximumSizeInBytes: ctx.config.media.maxUploadBytes,
+            addRandomSuffix: true,
+          };
+        },
+      });
+      res.json(result);
+    },
+  );
 
   router.post(
     '/',
     requirePermission('media:write'),
+    requireSafeStorage,
     uploadLimiter,
     upload.single('file'),
     async (req, res) => {
@@ -155,6 +175,7 @@ export function mediaAdminRoutes(ctx: AppContext, limiter: LimiterFactory): Rout
   router.post(
     '/',
     requirePermission('media:write'),
+    requireSafeStorage,
     uploadLimiter,
     upload.single('file'),
     async (req, res) => {
@@ -174,6 +195,7 @@ export function mediaAdminRoutes(ctx: AppContext, limiter: LimiterFactory): Rout
   router.post(
     '/:id/replace',
     requirePermission('media:write'),
+    requireSafeStorage,
     uploadLimiter,
     upload.single('file'),
     async (req, res) => {
@@ -195,24 +217,30 @@ export function mediaAdminRoutes(ctx: AppContext, limiter: LimiterFactory): Rout
     },
   );
 
-  router.post('/:id/recrop', requirePermission('media:write'), uploadLimiter, async (req, res) => {
-    const id = parseInput(objectIdSchema, req.params.id);
-    const input = parseInput(
-      z.object({
-        crop: mediaCropSchema.nullable().default(null),
-        alt: z.string().trim().max(200).optional(),
-      }),
-      req.body,
-    );
-    const asset = await recropAsset(ctx, id, input);
-    await audit(req, {
-      action: 'media.recrop',
-      entityType: 'media',
-      entityId: id,
-      summary: `Re-cropped image “${asset.originalFilename}” (revision ${asset.revision})`,
-    });
-    res.json({ data: mediaAssetDTO(asset, ctx.storage, null) });
-  });
+  router.post(
+    '/:id/recrop',
+    requirePermission('media:write'),
+    requireSafeStorage,
+    uploadLimiter,
+    async (req, res) => {
+      const id = parseInput(objectIdSchema, req.params.id);
+      const input = parseInput(
+        z.object({
+          crop: mediaCropSchema.nullable().default(null),
+          alt: z.string().trim().max(200).optional(),
+        }),
+        req.body,
+      );
+      const asset = await recropAsset(ctx, id, input);
+      await audit(req, {
+        action: 'media.recrop',
+        entityType: 'media',
+        entityId: id,
+        summary: `Re-cropped image “${asset.originalFilename}” (revision ${asset.revision})`,
+      });
+      res.json({ data: mediaAssetDTO(asset, ctx.storage, null) });
+    },
+  );
 
   router.get('/', requirePermission('media:read'), async (req, res) => {
     const query = parseInput(mediaListQuerySchema, req.query);

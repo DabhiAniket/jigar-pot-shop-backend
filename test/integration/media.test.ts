@@ -338,6 +338,29 @@ describe('image upload pipeline', () => {
       await expect(fs.access(fileOnDisk(`img/${original.id}/r1/thumb-240.webp`))).rejects.toThrow();
     });
 
+    it('blocks image writes when local-disk storage is paired with a remote database', async () => {
+      const original = await uploadReady();
+      harness.ctx.config.mongo.isLocal = false;
+      try {
+        const file = { filename: 'a.jpg', contentType: 'image/jpeg' };
+        const replace = await pm
+          .upload(`/api/v1/admin/media/${original.id}/replace`)
+          .attach('file', await makeTestImage(800, 600), file);
+        const recrop = await pm.post(`/api/v1/admin/media/${original.id}/recrop`, {});
+        const create = await pm
+          .upload('/api/v1/admin/media')
+          .attach('file', await makeTestImage(800, 600), file);
+        for (const response of [replace, recrop, create]) {
+          expect(response.status).toBe(409);
+          expect(response.body.error.code).toBe('STORAGE_MISMATCH');
+        }
+        // Nothing changed.
+        expect((await MediaAssetModel.findById(original.id).lean())!.revision).toBe(0);
+      } finally {
+        harness.ctx.config.mongo.isLocal = true;
+      }
+    });
+
     it('rejects unknown images, tiny crops, and callers without media permission', async () => {
       const original = await uploadReady();
       expect(
